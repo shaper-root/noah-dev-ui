@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+bun.lockb
+
+# Build output
+dist/
+build/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Databases — contains real user data from April use
+data/*.db
+data/*.db-wal
+data/*.db-shm
+dev.db
+dev.db-wal
+dev.db-shm
+
+# User uploads — real files
+uploads/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+logs/
