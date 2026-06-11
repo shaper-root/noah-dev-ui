@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "hono": "^4.7.0",
+    "hono": "^4.12.25",
     "pdf-parse": "^2.4.5"
   }
 }
