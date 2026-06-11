@@ -15,6 +15,9 @@ build/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/**/*.db
+data/**/*.db-wal
+data/**/*.db-shm
 dev.db
 dev.db-wal
 dev.db-shm

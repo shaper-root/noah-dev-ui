@@ -4,9 +4,11 @@
   "description": "Development interface for Noah AI assistant",
   "scripts": {
     "dev": "bun run --watch server.ts",
-    "start": "bun run server.ts"
+    "start": "bun run server.ts",
+    "recall-eval": "bun run eval/recall-at-k.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "hono": "^4.7.0",
     "pdf-parse": "^2.4.5"
   }
