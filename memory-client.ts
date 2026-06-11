@@ -168,7 +168,11 @@ class MemoryClient {
         nodeBin,
         ["--import", tsxRegister, serverFile],
         {
-          ...(process.env as Record<string, string>),
+          PATH: process.env.PATH ?? "",
+          SYSTEMROOT: process.env.SYSTEMROOT ?? "",
+          TEMP: process.env.TEMP ?? "",
+          TMP: process.env.TMP ?? "",
+          HOME: process.env.HOME ?? process.env.USERPROFILE ?? "",
           MEMORY_USER_ID: config.memory.userId,
           SQLITE_PATH: sqlitePath,
         },
