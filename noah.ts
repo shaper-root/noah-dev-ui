@@ -342,6 +342,16 @@ export async function* chat(
     data: JSON.stringify({
       tool_calls: toolCallsMade,
       total_ms: Date.now() - startTime,
+      provenance: {
+        model: config.provider,
+        model_id:
+          config.provider === "local"
+            ? config.ollama.model
+            : config.cloud.model,
+        memory_ids: recallResult.memories.map((m) => m.id),
+        tools_fired: [...new Set(toolCallsMade.map((tc) => tc.name))],
+        skills_active: [],
+      },
     }),
   };
 }

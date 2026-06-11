@@ -117,23 +117,30 @@ app.post("/api/chat", async (c) => {
   const body = await c.req.json();
   const userMessage: string = body.message;
   let conversationId: string | undefined = body.conversation_id;
+  const externalHistory: Array<{ role: string; content: string }> | undefined =
+    body.history;
 
   if (!userMessage) {
     return c.json({ error: "message is required" }, 400);
   }
 
-  // Create conversation if needed
-  if (!conversationId) {
-    const conv = DB.createConversation(userMessage);
-    conversationId = conv.id;
+  // Passthrough mode: caller provides history, skip local DB
+  const passthrough = Array.isArray(externalHistory);
+  let history: Array<{ role: string; content: string }>;
+  let userMsgId: string | undefined;
+
+  if (passthrough) {
+    history = externalHistory;
+    conversationId = conversationId || "external";
+  } else {
+    if (!conversationId) {
+      const conv = DB.createConversation(userMessage);
+      conversationId = conv.id;
+    }
+    const dbMessages = DB.getMessages(conversationId);
+    history = dbMessages.map((m) => ({ role: m.role, content: m.content }));
+    userMsgId = DB.addMessage(conversationId, "user", userMessage);
   }
-
-  // Load history from DB
-  const dbMessages = DB.getMessages(conversationId);
-  const history = dbMessages.map((m) => ({ role: m.role, content: m.content }));
-
-  // Store user message
-  const userMsgId = DB.addMessage(conversationId, "user", userMessage);
 
   // Stream response via SSE
   return new Response(
@@ -178,21 +185,23 @@ app.post("/api/chat", async (c) => {
                 send("error", event.data);
                 break;
               case "done": {
-                // Store assistant message
                 const doneData = JSON.parse(event.data);
-                const assistantMsgId = DB.addMessage(
-                  conversationId!,
-                  "assistant",
-                  fullResponse,
-                  {
-                    tool_calls: doneData.tool_calls,
-                    total_ms: doneData.total_ms,
-                  }
-                );
+                let assistantMsgId: string | undefined;
+                if (!passthrough) {
+                  assistantMsgId = DB.addMessage(
+                    conversationId!,
+                    "assistant",
+                    fullResponse,
+                    {
+                      tool_calls: doneData.tool_calls,
+                      total_ms: doneData.total_ms,
+                    }
+                  );
+                }
                 send("done", JSON.stringify({
                   ...doneData,
-                  user_message_id: userMsgId,
-                  assistant_message_id: assistantMsgId,
+                  ...(userMsgId && { user_message_id: userMsgId }),
+                  ...(assistantMsgId && { assistant_message_id: assistantMsgId }),
                   conversation_id: conversationId,
                 }));
                 break;
