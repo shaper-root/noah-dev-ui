@@ -9,7 +9,10 @@ const envInt = (key: string, fallback: number): number => {
 };
 
 export const config = {
-  provider: env("NOAH_PROVIDER", "local") as "local" | "cloud",
+  provider: (() => {
+    const mode = env("NOAH_MODEL_MODE", env("NOAH_PROVIDER", "local"));
+    return mode === "cloud" ? "cloud" : "local";
+  })() as "local" | "cloud",
 
   ollama: {
     url: env("OLLAMA_URL", "http://127.0.0.1:11434"),
@@ -19,9 +22,10 @@ export const config = {
   },
 
   cloud: {
-    url: env("NOAH_CLOUD_URL", ""),
-    key: env("NOAH_CLOUD_KEY", ""),
-    model: env("NOAH_CLOUD_MODEL", ""),
+    url: env("NOAH_CLOUD_URL", "https://api.fireworks.ai/inference/v1"),
+    key: env("FIREWORKS_API_KEY", env("NOAH_CLOUD_KEY", "")),
+    model: env("NOAH_CLOUD_MODEL", "accounts/fireworks/models/qwen3-8b-instruct"),
+    promptCache: (process.env.FIREWORKS_PROMPT_CACHE || "false") === "true",
   },
 
   memory: {
@@ -44,37 +48,22 @@ export function validateConfig(): void {
     process.exit(1);
   }
 
-  if (config.provider !== "local" && config.provider !== "cloud") {
-    console.error(
-      `[noah] NOAH_PROVIDER must be 'local' or 'cloud', got '${config.provider}'`,
+  if (config.provider === "cloud" && !config.cloud.key) {
+    console.warn(
+      "[noah] FIREWORKS_API_KEY not set — cloud requests will fail until configured",
     );
-    process.exit(1);
   }
 
-  if (config.provider === "cloud") {
-    if (!config.cloud.url) {
-      console.error("[noah] NOAH_CLOUD_URL required when NOAH_PROVIDER=cloud");
-      process.exit(1);
-    }
-    if (!config.cloud.key) {
-      console.error("[noah] NOAH_CLOUD_KEY required when NOAH_PROVIDER=cloud");
-      process.exit(1);
-    }
-    if (!config.cloud.model) {
-      console.error(
-        "[noah] NOAH_CLOUD_MODEL required when NOAH_PROVIDER=cloud",
-      );
-      process.exit(1);
-    }
-  }
-
-  console.log(`[noah] Provider: ${config.provider}`);
+  console.log(`[noah] Mode: ${config.provider}`);
   console.log(
     `[noah] Model: ${config.provider === "local" ? config.ollama.model : config.cloud.model}`,
   );
   if (config.provider === "local") {
     console.log(`[noah] Ollama: ${config.ollama.url}`);
     console.log(`[noah] Context: ${config.ollama.numCtx}`);
+  } else {
+    console.log(`[noah] Cloud URL: ${config.cloud.url}`);
+    console.log(`[noah] Prompt cache: ${config.cloud.promptCache}`);
   }
   console.log(`[noah] Memory user: ${config.memory.userId}`);
   console.log(`[noah] Web search: ${config.webSearch.provider}`);

@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { DB } from "./db";
+import { config } from "./config";
 import { chat } from "./noah";
 import {
   extractText,
@@ -225,6 +226,38 @@ app.post("/api/chat", async (c) => {
       },
     }
   );
+});
+
+// --- Mode ---
+
+app.get("/api/mode", (c) => {
+  return c.json({
+    mode: config.provider,
+    model:
+      config.provider === "local" ? config.ollama.model : config.cloud.model,
+    cloud_available: !!config.cloud.key,
+  });
+});
+
+app.post("/api/mode", async (c) => {
+  const body = await c.req.json();
+  const mode = body.mode;
+  if (mode !== "local" && mode !== "cloud") {
+    return c.json({ error: "mode must be 'local' or 'cloud'" }, 400);
+  }
+  if (mode === "cloud" && !config.cloud.key) {
+    return c.json(
+      { error: "FIREWORKS_API_KEY not set — cannot switch to cloud mode" },
+      400,
+    );
+  }
+  config.provider = mode as "local" | "cloud";
+  console.log(`[noah] Mode switched to: ${mode}`);
+  return c.json({
+    mode: config.provider,
+    model:
+      config.provider === "local" ? config.ollama.model : config.cloud.model,
+  });
 });
 
 // --- System Messages (Dream Mode notifications) ---

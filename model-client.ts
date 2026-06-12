@@ -119,6 +119,12 @@ class CloudClient implements ModelClient {
     messages: Message[],
     opts?: { tools?: ToolDef[] },
   ): Promise<ModelResponse> {
+    if (!config.cloud.key) {
+      throw new Error(
+        "FIREWORKS_API_KEY not set — set the environment variable to use cloud mode",
+      );
+    }
+
     const body: Record<string, unknown> = {
       model: config.cloud.model,
       messages: messages.map((m) => {
@@ -151,7 +157,7 @@ class CloudClient implements ModelClient {
       body.tools = opts.tools;
     }
 
-    const res = await fetch(`${config.cloud.url}/v1/chat/completions`, {
+    const res = await fetch(`${config.cloud.url}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -201,6 +207,23 @@ class CloudClient implements ModelClient {
 }
 
 export function createModelClient(): ModelClient {
-  if (config.provider === "cloud") return new CloudClient();
-  return new OllamaClient();
+  const local = new OllamaClient();
+  const cloud = new CloudClient();
+
+  return {
+    get name() {
+      return config.provider === "cloud" ? cloud.name : local.name;
+    },
+    get provider(): "local" | "cloud" {
+      return config.provider;
+    },
+    chat(
+      messages: Message[],
+      opts?: { tools?: ToolDef[]; stream?: false },
+    ): Promise<ModelResponse> {
+      return config.provider === "cloud"
+        ? cloud.chat(messages, opts)
+        : local.chat(messages, opts);
+    },
+  };
 }

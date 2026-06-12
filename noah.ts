@@ -243,6 +243,7 @@ export async function* chat(
       memories_found: recallResult.count,
       retrieve_ms: retrieveMs,
       memory_available: memoryClient.isAvailable,
+      signals: recallResult.signals,
     }),
   };
 

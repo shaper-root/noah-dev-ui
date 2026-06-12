@@ -8,7 +8,7 @@ import { resolve } from "path";
 import { pathToFileURL } from "url";
 import { config } from "./config";
 
-const HEALTH_RECHECK_MS = 60_000;
+const HEALTH_RECHECK_MS = 5_000;
 
 export interface RecalledMemory {
   id: string;
@@ -44,7 +44,11 @@ function parseMcpResult(result: { content: unknown; isError?: boolean }): unknow
         .map((c) => c.text || "")
         .join("")
     : String(result.content);
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
+  }
 }
 
 // Bun.spawn on Windows (v1.3.11): cwd breaks executable resolution, paths with

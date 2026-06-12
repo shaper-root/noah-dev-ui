@@ -806,10 +806,18 @@
               metaData = JSON.parse(data);
               if (metaData.memory_available) {
                 memoryStatus.className = 'status';
-                headerText.textContent = `${metaData.memories_found} memories found (${(metaData.retrieve_ms / 1000).toFixed(3)}s)`;
+                const sig = metaData.signals || {};
+                const parts = [`${metaData.memories_found} memories`];
+                if (sig.semantic > 0 || sig.keyword > 0 || sig.entity > 0) {
+                  parts.push(`sem:${sig.semantic||0} kw:${sig.keyword||0} ent:${sig.entity||0}`);
+                } else if (metaData.memories_found > 0) {
+                  parts.push('fallback:recency');
+                }
+                parts.push(`${(metaData.retrieve_ms / 1000).toFixed(3)}s`);
+                headerText.textContent = parts.join(' · ');
               } else {
                 memoryStatus.className = 'status down';
-                headerText.textContent = 'Memory server unavailable';
+                headerText.textContent = 'Memory: reconnecting...';
               }
               break;
             case 'thinking':
