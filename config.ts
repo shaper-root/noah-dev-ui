@@ -24,7 +24,7 @@ export const config = {
   cloud: {
     url: env("NOAH_CLOUD_URL", "https://api.fireworks.ai/inference/v1"),
     key: env("FIREWORKS_API_KEY", env("NOAH_CLOUD_KEY", "")),
-    model: env("NOAH_CLOUD_MODEL", "accounts/fireworks/models/qwen3-8b-instruct"),
+    model: env("NOAH_CLOUD_MODEL", "accounts/fireworks/models/qwen3p6-plus"),
     promptCache: (process.env.FIREWORKS_PROMPT_CACHE || "false") === "true",
   },
 
