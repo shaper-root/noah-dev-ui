@@ -798,6 +798,9 @@
         }
 
         function handleSSE(event, data) {
+          // token/thinking/error payloads are JSON-encoded on the wire so
+          // multi-line model output can't break SSE framing. Decode safely.
+          const decodeText = (d) => { try { return JSON.parse(d); } catch { return d; } };
           switch (event) {
             case 'conversation_id':
               currentConversationId = data;
@@ -821,7 +824,7 @@
               }
               break;
             case 'thinking':
-              thinkingEl.textContent = data;
+              thinkingEl.textContent = decodeText(data);
               break;
             case 'tool_call': {
               const tc = JSON.parse(data);
@@ -833,11 +836,11 @@
               break;
             }
             case 'token':
-              fullResponse += data;
+              fullResponse += decodeText(data);
               break;
             case 'error':
               thinkingEl.remove();
-              appendMessage('assistant', `Error: ${data}`);
+              appendMessage('assistant', `Error: ${decodeText(data)}`);
               break;
             case 'done': {
               thinkingEl.remove();

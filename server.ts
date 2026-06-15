@@ -18,6 +18,7 @@ import { dashboardRoutes } from "./routes/dashboard";
 import { dreamRoutes } from "./routes/dream";
 import { rulesRoutes } from "./routes/rules";
 import { analyticsRoutes } from "./routes/analytics";
+import { formatSSE, formatSSEComment, type SSEEventName } from "./sse";
 
 const app = new Hono();
 const PORT = 3333;
@@ -148,18 +149,29 @@ app.post("/api/chat", async (c) => {
     new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
-        const send = (event: string, data: string) => {
-          controller.enqueue(encoder.encode(`event: ${event}\ndata: ${data}\n\n`));
-        };
+        let terminated = false; // a done/error event has been emitted
+        let closed = false; // the consumer is gone; stop writing
 
-        // SSE keepalive: send comment every 10s to prevent browser timeout
-        const keepalive = setInterval(() => {
+        // Write a pre-encoded chunk. If the consumer has disconnected,
+        // controller.enqueue throws — swallow it and mark the stream closed so
+        // the generator runs to completion (chat.done logs, message persists)
+        // instead of being abandoned mid-flight.
+        const write = (chunk: string) => {
+          if (closed) return;
           try {
-            controller.enqueue(encoder.encode(": keepalive\n\n"));
+            controller.enqueue(encoder.encode(chunk));
           } catch {
-            clearInterval(keepalive);
+            closed = true;
           }
-        }, 10_000);
+        };
+        // Free-text events (token/thinking/error) are JSON-encoded so multi-line
+        // model output cannot break SSE framing. metadata/tool_call/done are
+        // already JSON object strings.
+        const send = (event: SSEEventName, data: string) => write(formatSSE(event, data));
+
+        // SSE keepalive: comment line every 10s prevents idle-timeout on
+        // intermediate proxies and browsers during long model responses.
+        const keepalive = setInterval(() => write(formatSSEComment("keepalive")), 10_000);
 
         // Send conversation ID first (for new conversations)
         send("conversation_id", conversationId!);
@@ -171,10 +183,10 @@ app.post("/api/chat", async (c) => {
             switch (event.type) {
               case "token":
                 fullResponse += event.data;
-                send("token", event.data);
+                send("token", JSON.stringify(event.data));
                 break;
               case "thinking":
-                send("thinking", event.data);
+                send("thinking", JSON.stringify(event.data));
                 break;
               case "tool_call":
                 send("tool_call", event.data);
@@ -183,7 +195,8 @@ app.post("/api/chat", async (c) => {
                 send("metadata", event.data);
                 break;
               case "error":
-                send("error", event.data);
+                send("error", JSON.stringify(event.data));
+                terminated = true;
                 break;
               case "done": {
                 const doneData = JSON.parse(event.data);
@@ -205,17 +218,30 @@ app.post("/api/chat", async (c) => {
                   ...(assistantMsgId && { assistant_message_id: assistantMsgId }),
                   conversation_id: conversationId,
                 }));
+                terminated = true;
                 break;
               }
             }
           }
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          send("error", message);
+          send("error", JSON.stringify(message));
+          terminated = true;
+        } finally {
+          clearInterval(keepalive);
+          // Clean stream termination: never let the stream just stop. If the
+          // generator exited without a done/error event, tell the consumer
+          // explicitly so it can finalize rather than hang.
+          if (!terminated) {
+            send("error", JSON.stringify("Stream ended without completion"));
+          }
+          closed = true;
+          try {
+            controller.close();
+          } catch {
+            /* already closed */
+          }
         }
-
-        clearInterval(keepalive);
-        controller.close();
       },
     }),
     {
