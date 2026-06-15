@@ -1,6 +1,7 @@
 import { config } from "./config";
 import { wrapAsData } from "./data-boundary";
 import { createKernel } from "./kernel-seam";
+import { log } from "./logger";
 import { memoryClient } from "./memory-client";
 import { createModelClient, type Message, type ToolCall } from "./model-client";
 import { getAllTools, dispatchTool } from "./tool-router";
@@ -194,22 +195,50 @@ export interface ChatEvent {
   data: string;
 }
 
+function estimateContextChars(messages: Message[]): number {
+  let total = 0;
+  for (const m of messages) {
+    total += m.content.length;
+    if (m.tool_calls) total += JSON.stringify(m.tool_calls).length;
+  }
+  return total;
+}
+
 export async function* chat(
   userMessage: string,
   conversationId: string,
   history: Array<{ role: string; content: string }>,
 ): AsyncGenerator<ChatEvent> {
   const startTime = Date.now();
+  log("info", "chat.start", { cid: conversationId, msgLen: userMessage.length, histLen: history.length });
 
-  const retrievalQuery = buildRetrievalQuery(userMessage, history);
-  const recallResult = await memoryClient.recall(retrievalQuery);
-  const retrieveMs = Date.now() - startTime;
+  let recallResult = { count: 0, signals: {} as Record<string, unknown>, totalMs: 0, memories: [] as Array<{ id: string }> };
+  let retrieveMs = 0;
+  let degraded = false;
 
-  const kernelResult = await kernel.process({
-    userMessage,
-    memories: recallResult.memories,
-    conversationHistory: history,
-  });
+  try {
+    const retrievalQuery = buildRetrievalQuery(userMessage, history);
+    recallResult = await memoryClient.recall(retrievalQuery) as typeof recallResult;
+    retrieveMs = Date.now() - startTime;
+    log("info", "recall.ok", { cid: conversationId, count: recallResult.count, ms: retrieveMs });
+  } catch (err) {
+    console.warn("[noah] Memory recall failed, continuing without memory:", err);
+    degraded = true;
+    retrieveMs = Date.now() - startTime;
+    log("warn", "recall.fail", { cid: conversationId, ms: retrieveMs, err: err instanceof Error ? err.message : String(err) });
+  }
+
+  let kernelResult = { processedMessage: userMessage, processedMemories: [] as unknown[] };
+  try {
+    kernelResult = await kernel.process({
+      userMessage,
+      memories: (recallResult as { memories: unknown[] }).memories,
+      conversationHistory: history,
+    }) as typeof kernelResult;
+  } catch (err) {
+    console.warn("[noah] Kernel processing failed, using raw message:", err);
+    degraded = true;
+  }
 
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -243,6 +272,7 @@ export async function* chat(
       memories_found: recallResult.count,
       retrieve_ms: retrieveMs,
       memory_available: memoryClient.isAvailable,
+      degraded,
       signals: recallResult.signals,
     }),
   };
@@ -258,18 +288,31 @@ export async function* chat(
     const tools = getAllTools();
 
     for (let round = 0; round <= config.maxToolRounds; round++) {
-      const includeTools = round < config.maxToolRounds;
+      const contextChars = estimateContextChars(messages);
+      const contextExceeded = contextChars > config.maxContextChars;
+      const includeTools = round < config.maxToolRounds && !contextExceeded;
 
-      if (round > 0) {
+      if (contextExceeded && round < config.maxToolRounds) {
+        console.warn(
+          `[noah] Context size ${contextChars} chars exceeds limit ${config.maxContextChars}, forcing final round`,
+        );
+        log("warn", "context.limit", { cid: conversationId, chars: contextChars, max: config.maxContextChars, round });
+        yield {
+          type: "thinking",
+          data: `Context limit reached (${Math.round(contextChars / 1000)}k chars), generating final response...`,
+        };
+      } else if (round > 0) {
         yield {
           type: "thinking",
           data: `Processing tool calls (round ${round})...`,
         };
       }
 
+      const modelStart = Date.now();
       const response = await modelClient.chat(messages, {
         tools: includeTools ? tools : undefined,
       });
+      log("info", "model.response", { cid: conversationId, round, ms: Date.now() - modelStart, contentLen: response.content.length, toolCalls: response.tool_calls.length });
 
       const toolCalls = parseToolCalls({
         content: response.content,
@@ -295,7 +338,16 @@ export async function* chat(
 
           yield { type: "tool_call", data: JSON.stringify({ name, args }) };
 
-          const result = await dispatchTool(tc);
+          let result: string;
+          const toolStart = Date.now();
+          try {
+            result = await dispatchTool(tc);
+            log("info", "tool.ok", { cid: conversationId, name, ms: Date.now() - toolStart });
+          } catch (toolErr) {
+            console.warn(`[noah] Tool ${name} failed:`, toolErr);
+            result = JSON.stringify({ error: `Tool ${name} failed: ${toolErr instanceof Error ? toolErr.message : String(toolErr)}` });
+            log("warn", "tool.fail", { cid: conversationId, name, ms: Date.now() - toolStart, err: toolErr instanceof Error ? toolErr.message : String(toolErr) });
+          }
           toolCallsMade.push({ name, args, result });
 
           messages.push({
@@ -327,6 +379,7 @@ export async function* chat(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[noah] Model error:", message);
+    log("error", "chat.error", { cid: conversationId, ms: Date.now() - startTime, err: message });
     yield { type: "error", data: message };
     return;
   }
@@ -335,14 +388,15 @@ export async function* chat(
   if (!responseText) {
     responseText = "I'm not sure how to respond to that.";
   }
-
   yield { type: "token", data: responseText };
 
+  const totalMs = Date.now() - startTime;
+  log("info", "chat.done", { cid: conversationId, ms: totalMs, toolCalls: toolCallsMade.length, degraded, provider: config.provider });
   yield {
     type: "done",
     data: JSON.stringify({
       tool_calls: toolCallsMade,
-      total_ms: Date.now() - startTime,
+      total_ms: totalMs,
       provenance: {
         model: config.provider,
         model_id:
@@ -352,6 +406,7 @@ export async function* chat(
         memory_ids: recallResult.memories.map((m) => m.id),
         tools_fired: [...new Set(toolCallsMade.map((tc) => tc.name))],
         skills_active: [],
+        degraded,
       },
     }),
   };

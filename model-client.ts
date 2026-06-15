@@ -157,52 +157,63 @@ class CloudClient implements ModelClient {
       body.tools = opts.tools;
     }
 
-    const res = await fetch(`${config.cloud.url}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${config.cloud.key}`,
-      },
-      body: JSON.stringify(body),
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      config.cloud.timeoutMs,
+    );
 
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Cloud ${res.status}: ${text}`);
+    try {
+      const res = await fetch(`${config.cloud.url}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${config.cloud.key}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Cloud ${res.status}: ${text}`);
+      }
+
+      const data = (await res.json()) as {
+        choices?: Array<{
+          message?: {
+            content?: string;
+            tool_calls?: Array<{
+              id: string;
+              function: { name: string; arguments: string };
+            }>;
+          };
+        }>;
+      };
+
+      const choice = data.choices?.[0]?.message || {};
+      const toolCalls: ToolCall[] = (choice.tool_calls || []).map((tc) => ({
+        id: tc.id,
+        function: {
+          name: tc.function.name,
+          arguments: (() => {
+            try {
+              return JSON.parse(tc.function.arguments);
+            } catch {
+              return tc.function.arguments;
+            }
+          })(),
+        },
+      }));
+
+      return {
+        content: choice.content || "",
+        tool_calls: toolCalls,
+        thinking: "",
+      };
+    } finally {
+      clearTimeout(timeout);
     }
-
-    const data = (await res.json()) as {
-      choices?: Array<{
-        message?: {
-          content?: string;
-          tool_calls?: Array<{
-            id: string;
-            function: { name: string; arguments: string };
-          }>;
-        };
-      }>;
-    };
-
-    const choice = data.choices?.[0]?.message || {};
-    const toolCalls: ToolCall[] = (choice.tool_calls || []).map((tc) => ({
-      id: tc.id,
-      function: {
-        name: tc.function.name,
-        arguments: (() => {
-          try {
-            return JSON.parse(tc.function.arguments);
-          } catch {
-            return tc.function.arguments;
-          }
-        })(),
-      },
-    }));
-
-    return {
-      content: choice.content || "",
-      tool_calls: toolCalls,
-      thinking: "",
-    };
   }
 }
 

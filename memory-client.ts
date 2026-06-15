@@ -7,8 +7,22 @@ import {
 import { resolve } from "path";
 import { pathToFileURL } from "url";
 import { config } from "./config";
+import { log } from "./logger";
 
 const HEALTH_RECHECK_MS = 5_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms,
+    );
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
 
 export interface RecalledMemory {
   id: string;
@@ -186,6 +200,7 @@ class MemoryClient {
 
       this.transport.onclose = () => {
         console.warn("[memory] MCP child process exited");
+        log("warn", "mcp.exit");
         this.client = null;
         this.transport = null;
         this.available = false;
@@ -195,8 +210,10 @@ class MemoryClient {
       await this.client.connect(this.transport);
       this.available = true;
       console.warn("[memory] Connected to MCP server");
+      log("info", "mcp.connect");
     } catch (err) {
       console.error("[memory] Failed to connect:", err);
+      log("error", "mcp.connect.fail", { err: err instanceof Error ? err.message : String(err) });
       this.client = null;
       this.transport = null;
       this.available = false;
@@ -207,8 +224,20 @@ class MemoryClient {
     }
   }
 
+  forceDisconnect(): void {
+    console.warn("[memory] Force-disconnecting MCP client");
+    log("warn", "mcp.force_disconnect");
+    try { this.transport?.close(); } catch {}
+    this.client = null;
+    this.transport = null;
+    this.available = false;
+    this.connecting = false;
+    this.lastFail = Date.now();
+  }
+
   async ensureConnected(): Promise<boolean> {
     if (this.client) return true;
+    if (this.connecting) return false;
 
     if (!this.available && Date.now() - this.lastFail < HEALTH_RECHECK_MS) {
       return false;
@@ -216,7 +245,7 @@ class MemoryClient {
 
     try {
       await this.connect();
-      return true;
+      return !!this.client;
     } catch {
       return false;
     }
@@ -240,16 +269,20 @@ class MemoryClient {
     if (!(await this.ensureConnected())) return empty;
 
     try {
-      const result = await this.client!.callTool({
-        name: "memory_recall",
-        arguments: {
-          query,
-          topK: opts?.topK ?? 10,
-          ...(opts?.type && { type: opts.type }),
-          ...(opts?.scope && { scope: opts.scope }),
-          ...(opts?.entities && { entities: opts.entities }),
-        },
-      });
+      const result = await withTimeout(
+        this.client!.callTool({
+          name: "memory_recall",
+          arguments: {
+            query,
+            topK: opts?.topK ?? 10,
+            ...(opts?.type && { type: opts.type }),
+            ...(opts?.scope && { scope: opts.scope }),
+            ...(opts?.entities && { entities: opts.entities }),
+          },
+        }),
+        config.mcpToolTimeoutMs,
+        "memory_recall",
+      );
 
       if (result.isError) {
         console.warn("[memory] recall error:", parseMcpResult(result));
@@ -259,8 +292,12 @@ class MemoryClient {
       return parseMcpResult(result) as RecallResult;
     } catch (err) {
       console.warn("[memory] recall failed:", err);
-      this.available = false;
-      this.lastFail = Date.now();
+      if (err instanceof Error && err.message.includes("timed out")) {
+        this.forceDisconnect();
+      } else {
+        this.available = false;
+        this.lastFail = Date.now();
+      }
       return empty;
     }
   }
@@ -279,18 +316,22 @@ class MemoryClient {
     if (!(await this.ensureConnected())) return null;
 
     try {
-      const result = await this.client!.callTool({
-        name: "memory_remember",
-        arguments: {
-          content,
-          ...(opts?.type && { type: opts.type }),
-          ...(opts?.category && { category: opts.category }),
-          ...(opts?.scope && { scope: opts.scope }),
-          ...(opts?.entities && { entities: opts.entities }),
-          ...(opts?.keywords && { keywords: opts.keywords }),
-          ...(opts?.supersedes && { supersedes: opts.supersedes }),
-        },
-      });
+      const result = await withTimeout(
+        this.client!.callTool({
+          name: "memory_remember",
+          arguments: {
+            content,
+            ...(opts?.type && { type: opts.type }),
+            ...(opts?.category && { category: opts.category }),
+            ...(opts?.scope && { scope: opts.scope }),
+            ...(opts?.entities && { entities: opts.entities }),
+            ...(opts?.keywords && { keywords: opts.keywords }),
+            ...(opts?.supersedes && { supersedes: opts.supersedes }),
+          },
+        }),
+        config.mcpToolTimeoutMs,
+        "memory_remember",
+      );
 
       if (result.isError) {
         console.warn("[memory] remember rejected:", parseMcpResult(result));
@@ -300,6 +341,9 @@ class MemoryClient {
       return parseMcpResult(result) as RememberResult;
     } catch (err) {
       console.warn("[memory] remember failed:", err);
+      if (err instanceof Error && err.message.includes("timed out")) {
+        this.forceDisconnect();
+      }
       return null;
     }
   }
@@ -308,14 +352,21 @@ class MemoryClient {
     if (!(await this.ensureConnected())) return null;
 
     try {
-      const result = await this.client!.callTool({
-        name: "memory_forget",
-        arguments: { memory_id: memoryId },
-      });
+      const result = await withTimeout(
+        this.client!.callTool({
+          name: "memory_forget",
+          arguments: { memory_id: memoryId },
+        }),
+        config.mcpToolTimeoutMs,
+        "memory_forget",
+      );
 
       return parseMcpResult(result) as Record<string, unknown>;
     } catch (err) {
       console.warn("[memory] forget failed:", err);
+      if (err instanceof Error && err.message.includes("timed out")) {
+        this.forceDisconnect();
+      }
       return null;
     }
   }
@@ -324,14 +375,21 @@ class MemoryClient {
     if (!(await this.ensureConnected())) return null;
 
     try {
-      const result = await this.client!.callTool({
-        name: "memory_inspect",
-        arguments: { memory_id: memoryId },
-      });
+      const result = await withTimeout(
+        this.client!.callTool({
+          name: "memory_inspect",
+          arguments: { memory_id: memoryId },
+        }),
+        config.mcpToolTimeoutMs,
+        "memory_inspect",
+      );
 
       return parseMcpResult(result) as Record<string, unknown>;
     } catch (err) {
       console.warn("[memory] inspect failed:", err);
+      if (err instanceof Error && err.message.includes("timed out")) {
+        this.forceDisconnect();
+      }
       return null;
     }
   }

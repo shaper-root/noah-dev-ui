@@ -26,6 +26,7 @@ export const config = {
     key: env("FIREWORKS_API_KEY", env("NOAH_CLOUD_KEY", "")),
     model: env("NOAH_CLOUD_MODEL", "accounts/fireworks/models/qwen3p6-plus"),
     promptCache: (process.env.FIREWORKS_PROMPT_CACHE || "false") === "true",
+    timeoutMs: envInt("NOAH_CLOUD_TIMEOUT_MS", 60_000),
   },
 
   memory: {
@@ -38,7 +39,9 @@ export const config = {
     provider: env("NOAH_WEB_SEARCH_PROVIDER", "stub") as "stub" | "ddg",
   },
 
-  maxToolRounds: 5,
+  maxToolRounds: envInt("NOAH_MAX_TOOL_ROUNDS", 3),
+  mcpToolTimeoutMs: envInt("NOAH_MCP_TOOL_TIMEOUT_MS", 15_000),
+  maxContextChars: envInt("NOAH_MAX_CONTEXT_CHARS", 40_000),
   shortUtteranceThreshold: 5,
 };
 
