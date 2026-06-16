@@ -518,6 +518,8 @@ describe("Phase 2: memory store verification + provenance", () => {
     expect(capturedTopK).toBe(30);
 
     // Reset and re-test for plain explicit recall (non-vague) → topK 20.
+    // Pass a non-empty history so we're past the first-message-of-session
+    // override (which would otherwise force topK=30 — Phase 6A).
     mockRecall.mockClear();
     capturedQuery = "";
     capturedTopK = undefined;
@@ -526,18 +528,105 @@ describe("Phase 2: memory store verification + provenance", () => {
       capturedTopK = opts?.topK;
       return EMPTY_RECALL;
     });
-    await collect(chat("tell me about the noah project", "expand-2", []));
+    await collect(
+      chat("tell me about the noah project", "expand-2", [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "hello" },
+      ]),
+    );
     expect(capturedTopK).toBe(20);
 
-    // Ambient (no explicit recall, not vague) → topK 10.
+    // Ambient (no explicit recall, not vague, not first message) → topK 10.
     mockRecall.mockClear();
     capturedTopK = undefined;
     mockRecall.mockImplementation(async (q: string, opts?: { topK?: number }) => {
       capturedTopK = opts?.topK;
       return EMPTY_RECALL;
     });
-    await collect(chat("I had a great morning", "expand-3", []));
+    await collect(
+      chat("I had a great morning", "expand-3", [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "hello" },
+      ]),
+    );
     expect(capturedTopK).toBe(10);
+  });
+
+  test("Phase 6A: first message of session uses topK=30 even on a non-vague query", async () => {
+    let capturedTopK: number | undefined;
+    mockRecall.mockImplementation(async (_q: string, opts?: { topK?: number }) => {
+      capturedTopK = opts?.topK;
+      return EMPTY_RECALL;
+    });
+
+    // Empty history === first message of session. Mundane query — without 6A
+    // this would be topK=10.
+    await collect(chat("hey", "first-1", []));
+    expect(capturedTopK).toBe(30);
+  });
+
+  test("Phase 6A: session_start_brief flag fires only when memory has something to brief on", async () => {
+    // History empty AND recall returns one memory → flag true.
+    mockRecall.mockResolvedValueOnce({
+      count: 1,
+      signals: {},
+      totalMs: 0,
+      memories: [
+        {
+          id: "m1",
+          content: "Root's daughter is Luna.",
+          type: "fact",
+          category: "stable",
+          scope: "family",
+          source: "seed",
+          entities: ["Luna"],
+          keywords: [],
+          confidence: 1,
+          created_at: "2025-01-01T00:00:00Z",
+          score: 0.9,
+        },
+      ],
+    });
+    let events = await collect(chat("hi", "first-2", []));
+    let meta = JSON.parse(events.find((e: ChatEvent) => e.type === "metadata")!.data);
+    expect(meta.session_start_brief).toBe(true);
+
+    // Same first message but recall returns nothing → flag false (don't force
+    // a confabulated "where we left off").
+    mockRecall.mockResolvedValueOnce(EMPTY_RECALL);
+    events = await collect(chat("hi", "first-3", []));
+    meta = JSON.parse(events.find((e: ChatEvent) => e.type === "metadata")!.data);
+    expect(meta.session_start_brief).toBe(false);
+
+    // Non-first message → flag false even if memory is rich.
+    mockRecall.mockResolvedValueOnce({
+      count: 1,
+      signals: {},
+      totalMs: 0,
+      memories: [
+        {
+          id: "m1",
+          content: "x",
+          type: "fact",
+          category: "stable",
+          scope: "x",
+          source: "seed",
+          entities: [],
+          keywords: [],
+          confidence: 1,
+          created_at: "2025-01-01T00:00:00Z",
+          score: 1,
+        },
+      ],
+    });
+    events = await collect(
+      chat("hi", "non-first", [
+        { role: "user", content: "earlier" },
+        { role: "assistant", content: "ok" },
+      ]),
+    );
+    meta = JSON.parse(events.find((e: ChatEvent) => e.type === "metadata")!.data);
+    expect(meta.session_start_brief).toBe(false);
   });
 
   test("memory tools remain available when context exceeds limit (Phase 2B carve-out)", async () => {

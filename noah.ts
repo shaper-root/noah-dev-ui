@@ -352,6 +352,13 @@ export async function* chat(
   let retrieveMs = 0;
   let degraded = false;
 
+  // Phase 6A: first message of a new conversation. history.length === 0 means
+  // this is a fresh session — Noah's continuity-vs-Claude advantage is
+  // tangible only if the very first response shows it. Widen topK to 30 (max
+  // tier) so there's enough context to compose a brief "where we left off"
+  // opener without an extra round-trip.
+  const isFirstMessageOfSession = history.length === 0;
+
   try {
     const baseQuery = buildRetrievalQuery(userMessage, history);
     // Phase 3B: expand vague identity/values/preferences queries with
@@ -367,7 +374,15 @@ export async function* chat(
       VAGUE_IDENTITY_PATTERN.test(baseQuery) ||
       VAGUE_VALUES_PATTERN.test(baseQuery) ||
       VAGUE_PREFS_PATTERN.test(baseQuery);
-    const topK = isVague ? 30 : explicitRecall ? 20 : 10;
+    // First message + vague/explicit are layered: first message wins because
+    // continuity briefing needs the broadest possible context.
+    const topK = isFirstMessageOfSession
+      ? 30
+      : isVague
+        ? 30
+        : explicitRecall
+          ? 20
+          : 10;
     recallResult = await memoryClient.recall(retrievalQuery, { topK }) as typeof recallResult;
     retrieveMs = Date.now() - startTime;
     log("info", "recall.ok", {
@@ -377,6 +392,7 @@ export async function* chat(
       topK,
       expanded: retrievalQuery !== baseQuery,
       explicit_recall: explicitRecall,
+      first_message: isFirstMessageOfSession,
     });
   } catch (err) {
     console.warn("[noah] Memory recall failed, continuing without memory:", err);
@@ -424,7 +440,23 @@ export async function* chat(
   const correctionsBlock = buildCorrectionsBlock(conversationId);
 
   const memoryContext = wrapAsData(kernelResult.processedMemories);
-  const userContext = `\n${memoryContext}\n\n[SESSION CORRECTIONS]\n${correctionsBlock}`;
+
+  // Phase 6A: on the first message of a new conversation, prompt Noah to lead
+  // with a 2-3 sentence "where we left off" using the recalled memory block
+  // BEFORE answering the user's message. Only fires when memory actually
+  // returned something to brief on — otherwise it would force a confabulation.
+  const sessionPrep =
+    isFirstMessageOfSession && recallResult.count > 0
+      ? `\n\n[SESSION START — first message of this conversation]\n` +
+        `Lead with a brief (2-3 sentence) "where we left off" using the recalled\n` +
+        `memory block above. Make continuity tangible from the first reply: name\n` +
+        `the most recent thread or two, then answer the user's message. Do NOT\n` +
+        `produce a wall of text; this is an orientation, not a recap. If memory\n` +
+        `is sparse or weakly relevant, skip the opener and just answer — honest\n` +
+        `brevity beats forced continuity.\n`
+      : "";
+
+  const userContext = `\n${memoryContext}${sessionPrep}\n\n[SESSION CORRECTIONS]\n${correctionsBlock}`;
   const augmentedUserMessage = kernelResult.processedMessage + userContext;
 
   // Injection order: [system prompt] → [kernel] → [self-knowledge] → [memory] → [user].
@@ -467,6 +499,10 @@ export async function* chat(
       // intent, so a missing memory_remember + missing acknowledgement can be
       // flagged immediately instead of being noticed days later.
       explicit_memory_intent: explicitMemoryIntent,
+      // Phase 6A: surfaces to the UI that Noah was prompted to open with a
+      // continuity briefing on this turn (history was empty AND memory had
+      // something to brief on).
+      session_start_brief: isFirstMessageOfSession && recallResult.count > 0,
       kernel: {
         active: kernelLoad.active,
         tier: kernelLoad.tier,
