@@ -467,6 +467,72 @@ describe("Phase 2: memory store verification + provenance", () => {
     expect(done.explicit_memory_intent).toBe(true);
   });
 
+  test("Phase 3B: expandVagueQuery rewrites identity queries with keyword anchors", async () => {
+    const { expandVagueQuery } = await import("./noah");
+    expect(expandVagueQuery("what do you know about me?")).toContain("identity");
+    expect(expandVagueQuery("tell me about myself")).toContain("identity");
+    expect(expandVagueQuery("Who am I")).toContain("identity");
+    expect(expandVagueQuery("what are my values?")).toContain("CARE");
+    expect(expandVagueQuery("what do I prefer")).toContain("preference");
+
+    // Specific queries pass through unchanged.
+    expect(expandVagueQuery("what books are on my desk?")).toBe(
+      "what books are on my desk?",
+    );
+    expect(expandVagueQuery("hello")).toBe("hello");
+  });
+
+  test("Phase 3C: detectExplicitRecallIntent recognizes memory-read questions", async () => {
+    const { detectExplicitRecallIntent } = await import("./noah");
+    expect(detectExplicitRecallIntent("what do I prefer")).toBe(true);
+    expect(detectExplicitRecallIntent("what are my values")).toBe(true);
+    expect(detectExplicitRecallIntent("tell me about my projects")).toBe(true);
+    expect(detectExplicitRecallIntent("do you remember the books?")).toBe(true);
+    expect(detectExplicitRecallIntent("did I mention the meeting?")).toBe(true);
+    expect(detectExplicitRecallIntent("search my memory for X")).toBe(true);
+
+    expect(detectExplicitRecallIntent("hello")).toBe(false);
+    expect(detectExplicitRecallIntent("how is the weather")).toBe(false);
+  });
+
+  test("Phase 3B+C: vague query expansion AND topK boost both flow into recall", async () => {
+    let capturedQuery = "";
+    let capturedTopK: number | undefined;
+    mockRecall.mockImplementation(async (q: string, opts?: { topK?: number }) => {
+      capturedQuery = q;
+      capturedTopK = opts?.topK;
+      return EMPTY_RECALL;
+    });
+
+    await collect(chat("what do you know about me?", "expand-1", []));
+    // Expansion appended identity keywords.
+    expect(capturedQuery).toContain("identity");
+    // Vague identity gets the highest topK boost (30).
+    expect(capturedTopK).toBe(30);
+
+    // Reset and re-test for plain explicit recall (non-vague) → topK 20.
+    mockRecall.mockClear();
+    capturedQuery = "";
+    capturedTopK = undefined;
+    mockRecall.mockImplementation(async (q: string, opts?: { topK?: number }) => {
+      capturedQuery = q;
+      capturedTopK = opts?.topK;
+      return EMPTY_RECALL;
+    });
+    await collect(chat("tell me about the noah project", "expand-2", []));
+    expect(capturedTopK).toBe(20);
+
+    // Ambient (no explicit recall, not vague) → topK 10.
+    mockRecall.mockClear();
+    capturedTopK = undefined;
+    mockRecall.mockImplementation(async (q: string, opts?: { topK?: number }) => {
+      capturedTopK = opts?.topK;
+      return EMPTY_RECALL;
+    });
+    await collect(chat("I had a great morning", "expand-3", []));
+    expect(capturedTopK).toBe(10);
+  });
+
   test("memory tools remain available when context exceeds limit (Phase 2B carve-out)", async () => {
     // Force context-exceeded on round 0 so tools would normally be dropped.
     testConfig.maxContextChars = 100;

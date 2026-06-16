@@ -39,6 +39,28 @@ function provenanceLabel(source: string): string {
   }
 }
 
+/**
+ * Explicit trust score per source, matching the trust hierarchy declared in the
+ * P1 status doc (seed/manual 1.0, conversation/consolidation 0.85, web 0.6).
+ * Surfaced inline in the recalled-memory block so the kernel's ground-check and
+ * disconfirmation-discipline have a number to key on instead of inferring from
+ * the source string. Phase 3D.
+ */
+function trustScore(source: string): number {
+  switch (source) {
+    case "seed":
+    case "manual":
+      return 1.0;
+    case "conversation":
+    case "consolidation":
+      return 0.85;
+    case "web_research":
+      return 0.6;
+    default:
+      return 0.5;
+  }
+}
+
 function formatDate(isoString: string): string {
   try {
     const dt = new Date(isoString);
@@ -60,9 +82,16 @@ export function wrapAsData(memories: RecalledMemory[]): string {
 
   for (let i = 0; i < memories.length; i++) {
     const mem = memories[i];
-    lines.push(`[${i + 1}] content: "${escapeDelimiters(mem.content)}"`);
+    const trust = trustScore(mem.source);
+    // Format: [N] [source, trust X.XX] content: "..."
+    // The trust tag is scannable so the model's ground-check / disconfirmation
+    // discipline can apply different treatment to seed (1.0, don't challenge)
+    // vs agent-written (0.85, can be revised) vs web (0.6, verify before use).
     lines.push(
-      `    source: ${mem.source} | confidence: ${Math.round(mem.confidence * 100)}% | learned: ${formatDate(mem.created_at)}`,
+      `[${i + 1}] [${mem.source}, trust ${trust.toFixed(2)}] content: "${escapeDelimiters(mem.content)}"`,
+    );
+    lines.push(
+      `    confidence: ${Math.round(mem.confidence * 100)}% | learned: ${formatDate(mem.created_at)}`,
     );
     lines.push(`    provenance: ${provenanceLabel(mem.source)}`);
     lines.push("");

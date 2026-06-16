@@ -141,6 +141,57 @@ function buildRetrievalQuery(
   return recentUserMessages.join(" ");
 }
 
+/**
+ * Phase 3B: lightweight query expansion for vague queries.
+ *
+ * The 3-signal retrieval pipeline (FTS + vector + entity) is keyword-dependent
+ * at the FTS layer and embedding-dependent at the vector layer. A query like
+ * "what do you know about me?" gives FTS only ["know","about","me"] (matches
+ * nothing) and a very generic embedding (matches everything weakly). The
+ * recency fallback then returns latest-by-date memories — not the identity-
+ * relevant ones.
+ *
+ * The fix is to detect vague identity/values/preferences queries and append a
+ * targeted keyword set BEFORE recall, so FTS gets real terms to match on and
+ * the embedding gets concrete anchors. Returns the original query unchanged
+ * when no pattern matches.
+ *
+ * Kept rule-based + cheap: a 5ms regex, no extra model round-trip.
+ */
+const VAGUE_IDENTITY_PATTERN =
+  /\b(?:what\s+do\s+you\s+know\s+about\s+(?:me|myself)|tell\s+me\s+about\s+(?:me|myself)|who\s+am\s+i)\b/i;
+const VAGUE_VALUES_PATTERN =
+  /\b(?:what\s+are\s+my\s+values|what\s+do\s+i\s+(?:believe|value))\b/i;
+const VAGUE_PREFS_PATTERN =
+  /\b(?:what\s+are\s+my\s+preferences|what\s+do\s+i\s+(?:like|prefer)|how\s+do\s+i\s+like)\b/i;
+
+export function expandVagueQuery(query: string): string {
+  if (VAGUE_IDENTITY_PATTERN.test(query)) {
+    return `${query} Root identity personality family work projects values preferences goals`;
+  }
+  if (VAGUE_VALUES_PATTERN.test(query)) {
+    return `${query} values principles beliefs CARE framework Earthseed`;
+  }
+  if (VAGUE_PREFS_PATTERN.test(query)) {
+    return `${query} preference likes dislikes prefers`;
+  }
+  return query;
+}
+
+/**
+ * Phase 3C: detect when the user is asking a memory-read question that should
+ * widen top-k. Defaults of 10 are fine for an ambient recall on a long-form
+ * turn, but when the user is explicitly asking "what do you know / what are my
+ * X / tell me about Y", missing the relevant memory because rank 11 was cut is
+ * the failure mode we are fixing.
+ */
+const EXPLICIT_RECALL_PATTERN =
+  /\b(?:what\s+(?:do\s+i|are\s+my|did\s+i)|tell\s+me\s+(?:about|what)|do\s+you\s+(?:know|remember|recall)|have\s+i\s+|did\s+i\s+(?:say|tell|mention)|remind\s+me\s+(?:about|what|of)|search\s+(?:my\s+)?memor(?:y|ies)|who\s+am\s+i)\b/i;
+
+export function detectExplicitRecallIntent(query: string): boolean {
+  return EXPLICIT_RECALL_PATTERN.test(query);
+}
+
 function extractJsonObject(text: string, start: number): string | null {
   if (start >= text.length || text[start] !== "{") return null;
   let depth = 0;
@@ -289,10 +340,31 @@ export async function* chat(
   let degraded = false;
 
   try {
-    const retrievalQuery = buildRetrievalQuery(userMessage, history);
-    recallResult = await memoryClient.recall(retrievalQuery) as typeof recallResult;
+    const baseQuery = buildRetrievalQuery(userMessage, history);
+    // Phase 3B: expand vague identity/values/preferences queries with
+    // targeted keywords so FTS has real terms to match and the embedding has
+    // concrete anchors instead of a generic question shape.
+    const retrievalQuery = expandVagueQuery(baseQuery);
+    // Phase 3C: widen top-k when the user is explicitly asking a memory-read
+    // question. Ambient recall stays at 10; an explicit "what do I X" goes to
+    // 20, vague identity queries to 30 (need broad context to compose an
+    // honest "here's what I know" answer).
+    const explicitRecall = detectExplicitRecallIntent(userMessage);
+    const isVague =
+      VAGUE_IDENTITY_PATTERN.test(baseQuery) ||
+      VAGUE_VALUES_PATTERN.test(baseQuery) ||
+      VAGUE_PREFS_PATTERN.test(baseQuery);
+    const topK = isVague ? 30 : explicitRecall ? 20 : 10;
+    recallResult = await memoryClient.recall(retrievalQuery, { topK }) as typeof recallResult;
     retrieveMs = Date.now() - startTime;
-    log("info", "recall.ok", { cid: conversationId, count: recallResult.count, ms: retrieveMs });
+    log("info", "recall.ok", {
+      cid: conversationId,
+      count: recallResult.count,
+      ms: retrieveMs,
+      topK,
+      expanded: retrievalQuery !== baseQuery,
+      explicit_recall: explicitRecall,
+    });
   } catch (err) {
     console.warn("[noah] Memory recall failed, continuing without memory:", err);
     degraded = true;

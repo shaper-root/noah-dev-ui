@@ -40,12 +40,13 @@ describe("wrapAsData", () => {
   test("includes provenance for each memory", () => {
     const result = wrapAsData([makeMem()]);
 
-    expect(result).toContain("source: conversation");
+    // Phase 3D: source + explicit trust score appear in the head tag.
+    expect(result).toContain("[conversation, trust 0.85]");
     expect(result).toContain("confidence: 85%");
     expect(result).toContain("provenance: agent-written, conversation-sourced");
   });
 
-  test("formats seed source with correct provenance", () => {
+  test("formats seed source with trust 1.00 + provenance", () => {
     const result = wrapAsData([
       makeMem({
         content: "Root's daughter is Luna.",
@@ -55,17 +56,17 @@ describe("wrapAsData", () => {
       }),
     ]);
 
-    expect(result).toContain("source: seed");
+    expect(result).toContain("[seed, trust 1.00]");
     expect(result).toContain("confidence: 100%");
     expect(result).toContain("provenance: seed-loaded, manual-sourced");
   });
 
-  test("formats web_research source as low trust", () => {
+  test("formats web_research source as trust 0.60", () => {
     const result = wrapAsData([
       makeMem({ source: "web_research", confidence: 0.6 }),
     ]);
 
-    expect(result).toContain("source: web_research");
+    expect(result).toContain("[web_research, trust 0.60]");
     expect(result).toContain("confidence: 60%");
     expect(result).toContain("provenance: web-sourced, low trust");
   });
@@ -87,9 +88,10 @@ describe("wrapAsData", () => {
       makeMem({ id: "test-3", content: "Third memory" }),
     ]);
 
-    expect(result).toContain('[1] content: "First memory"');
-    expect(result).toContain('[2] content: "Second memory"');
-    expect(result).toContain('[3] content: "Third memory"');
+    // Phase 3D: each entry leads with [N] [source, trust X.XX] content: "...".
+    expect(result).toContain('[1] [conversation, trust 0.85] content: "First memory"');
+    expect(result).toContain('[2] [conversation, trust 0.85] content: "Second memory"');
+    expect(result).toContain('[3] [conversation, trust 0.85] content: "Third memory"');
   });
 
   test("injection content is contained within data boundary", () => {
