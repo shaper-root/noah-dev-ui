@@ -47,6 +47,13 @@ mock.module("./memory-client", () => ({
 }));
 mock.module("./tool-router", () => ({
   getAllTools: mockGetAllTools,
+  // Derive memory-only tools from whatever getAllTools is mocked to return —
+  // keeps tests honest about the Phase 2B carve-out (memory tools survive the
+  // context guard).
+  getMemoryTools: () =>
+    (mockGetAllTools() as Array<{ function: { name: string } }>).filter((t) =>
+      t.function.name.startsWith("memory_"),
+    ),
   dispatchTool: mockDispatchTool,
 }));
 mock.module("./kernel", () => ({
@@ -319,5 +326,184 @@ describe("agent loop resilience", () => {
     expect(token!.data).toContain("Here is a real answer.");
     expect(token!.data).not.toContain('"name"'); // raw tool-call JSON must not leak
     expect(events.some((e: ChatEvent) => e.type === "error")).toBe(false);
+  });
+});
+
+describe("Phase 2: memory store verification + provenance", () => {
+  test("detectExplicitMemoryIntent recognizes common phrasings", async () => {
+    const { detectExplicitMemoryIntent } = await import("./noah");
+    expect(detectExplicitMemoryIntent("remember the books on my desk")).toBe(true);
+    expect(detectExplicitMemoryIntent("Please remember that I prefer dark mode")).toBe(true);
+    expect(detectExplicitMemoryIntent("Save this for later")).toBe(true);
+    expect(detectExplicitMemoryIntent("Don't forget the meeting Tuesday")).toBe(true);
+    expect(detectExplicitMemoryIntent("Make a note: schema changes Q3")).toBe(true);
+    expect(detectExplicitMemoryIntent("memorize my address")).toBe(true);
+    expect(detectExplicitMemoryIntent("file that away")).toBe(true);
+    expect(detectExplicitMemoryIntent("write this down")).toBe(true);
+
+    // Negative cases — these should NOT trigger explicit intent.
+    expect(detectExplicitMemoryIntent("Hello there")).toBe(false);
+    expect(detectExplicitMemoryIntent("What's the weather like?")).toBe(false);
+    expect(detectExplicitMemoryIntent("I want to talk about my project")).toBe(false);
+  });
+
+  test("metadata event carries explicit_memory_intent flag", async () => {
+    const events = await collect(chat("remember the books on my desk", "explicit-1", []));
+    const meta = events.find((e: ChatEvent) => e.type === "metadata");
+    expect(meta).toBeDefined();
+    expect(JSON.parse(meta!.data).explicit_memory_intent).toBe(true);
+
+    const events2 = await collect(chat("hello", "explicit-2", []));
+    const meta2 = events2.find((e: ChatEvent) => e.type === "metadata");
+    expect(JSON.parse(meta2!.data).explicit_memory_intent).toBe(false);
+  });
+
+  test("explicit intent injects explicit=true into memory_remember args", async () => {
+    mockGetAllTools.mockReturnValue([
+      {
+        type: "function",
+        function: { name: "memory_remember", description: "store", parameters: {} },
+      },
+    ]);
+    mockDispatchTool.mockResolvedValue(
+      JSON.stringify({ stored: true, id: "uuid-1", confidence: 0.9, embedded: true, explicit: true }),
+    );
+
+    mockModelChat
+      .mockResolvedValueOnce({
+        content: "",
+        tool_calls: [
+          {
+            id: "c1",
+            function: {
+              name: "memory_remember",
+              arguments: { content: "books are on the desk", type: "fact" },
+            },
+          },
+        ],
+        thinking: "",
+      })
+      .mockResolvedValueOnce({ content: "Got it.", tool_calls: [], thinking: "" });
+
+    await collect(chat("remember the books on my desk", "explicit-3", []));
+    // The dispatched call must carry explicit=true even though the model did not
+    // emit it — noah.ts injected it because the user message tripped intent.
+    const dispatchedArgs = (mockDispatchTool.mock.calls[0]?.[0] as {
+      function: { arguments: Record<string, unknown> };
+    })?.function.arguments;
+    expect(dispatchedArgs.explicit).toBe(true);
+  });
+
+  test("non-explicit intent does NOT inject explicit=true", async () => {
+    mockGetAllTools.mockReturnValue([
+      {
+        type: "function",
+        function: { name: "memory_remember", description: "store", parameters: {} },
+      },
+    ]);
+    mockDispatchTool.mockResolvedValue(
+      JSON.stringify({ stored: true, id: "uuid-2", confidence: 0.9, embedded: true }),
+    );
+
+    mockModelChat
+      .mockResolvedValueOnce({
+        content: "",
+        tool_calls: [
+          {
+            id: "c1",
+            function: { name: "memory_remember", arguments: { content: "user said hi" } },
+          },
+        ],
+        thinking: "",
+      })
+      .mockResolvedValueOnce({ content: "Hi.", tool_calls: [], thinking: "" });
+
+    await collect(chat("hi there", "not-explicit", []));
+    const dispatchedArgs = (mockDispatchTool.mock.calls[0]?.[0] as {
+      function: { arguments: Record<string, unknown> };
+    })?.function.arguments;
+    expect(dispatchedArgs.explicit).toBeUndefined();
+  });
+
+  test("done event surfaces memory store outcomes (both stored and failed)", async () => {
+    mockGetAllTools.mockReturnValue([
+      {
+        type: "function",
+        function: { name: "memory_remember", description: "store", parameters: {} },
+      },
+    ]);
+    // First call: success. Second call: failure (e.g., MCP timeout).
+    mockDispatchTool
+      .mockResolvedValueOnce(
+        JSON.stringify({ stored: true, id: "uuid-ok", confidence: 0.9, embedded: true }),
+      )
+      .mockResolvedValueOnce(
+        JSON.stringify({
+          stored: false,
+          kind: "timeout",
+          reason: "memory_remember timed out after 15000ms",
+        }),
+      );
+
+    mockModelChat
+      .mockResolvedValueOnce({
+        content: "",
+        tool_calls: [
+          { id: "c1", function: { name: "memory_remember", arguments: { content: "fact one" } } },
+          { id: "c2", function: { name: "memory_remember", arguments: { content: "fact two" } } },
+        ],
+        thinking: "",
+      })
+      .mockResolvedValueOnce({ content: "Tried to store two.", tool_calls: [], thinking: "" });
+
+    const events = await collect(chat("remember these two facts", "verify-1", []));
+    const done = JSON.parse(events.find((e: ChatEvent) => e.type === "done")!.data);
+
+    expect(done.memory_stores).toHaveLength(2);
+    expect(done.memory_stores[0].stored).toBe(true);
+    expect(done.memory_stores[0].id).toBe("uuid-ok");
+    expect(done.memory_stores[1].stored).toBe(false);
+    expect(done.memory_stores[1].kind).toBe("timeout");
+    expect(done.explicit_memory_intent).toBe(true);
+  });
+
+  test("memory tools remain available when context exceeds limit (Phase 2B carve-out)", async () => {
+    // Force context-exceeded on round 0 so tools would normally be dropped.
+    testConfig.maxContextChars = 100;
+
+    mockGetAllTools.mockReturnValue([
+      {
+        type: "function",
+        function: { name: "memory_remember", description: "store", parameters: {} },
+      },
+      {
+        type: "function",
+        function: { name: "web_research", description: "search", parameters: {} },
+      },
+    ]);
+    mockDispatchTool.mockResolvedValue(
+      JSON.stringify({ stored: true, id: "uuid-late", confidence: 0.9, embedded: true }),
+    );
+
+    mockModelChat
+      .mockResolvedValueOnce({
+        content: "",
+        tool_calls: [
+          { id: "c1", function: { name: "memory_remember", arguments: { content: "late fact" } } },
+        ],
+        thinking: "",
+      })
+      .mockResolvedValueOnce({ content: "Stored under pressure.", tool_calls: [], thinking: "" });
+
+    const events = await collect(
+      chat("remember this", "carveout-1", [
+        { role: "user", content: "x".repeat(500) },
+      ]),
+    );
+
+    // The memory_remember tool MUST have dispatched, even though context exceeded.
+    expect(mockDispatchTool).toHaveBeenCalled();
+    const done = JSON.parse(events.find((e: ChatEvent) => e.type === "done")!.data);
+    expect(done.memory_stores[0].stored).toBe(true);
   });
 });

@@ -6,7 +6,7 @@ import { detectSkills } from "./skill-detect";
 import { log } from "./logger";
 import { memoryClient } from "./memory-client";
 import { createModelClient, type Message, type ToolCall } from "./model-client";
-import { getAllTools, dispatchTool } from "./tool-router";
+import { getAllTools, getMemoryTools, dispatchTool } from "./tool-router";
 
 const MAX_CORRECTIONS = 50;
 const MAX_SESSION_CONVERSATIONS = 500; // bound the in-process corrections map
@@ -105,6 +105,25 @@ function buildCorrectionsBlock(conversationId: string): string {
   const corrections = sessionCorrections.get(conversationId) || [];
   if (!corrections.length) return "No corrections this session.";
   return corrections.map((c) => `- ${c}`).join("\n");
+}
+
+/**
+ * Detect an unambiguous "remember this" intent in the user's message. When true,
+ * any memory_remember call in this turn bypasses the worthiness gate (the gate
+ * exists to suppress noisy agent-inferred captures — when the user explicitly
+ * asks, suppression is a bug, not a feature).
+ *
+ * Pattern is intentionally conservative: keyword + context. "I'll remember that
+ * for you" wouldn't match (no first-person store intent toward Noah); "remember
+ * the books on my desk" does. False positives are cheap (a gate bypass for an
+ * agent-inferred write the agent would have written anyway); false negatives are
+ * the failure we are fixing.
+ */
+const EXPLICIT_MEMORY_PATTERN =
+  /\b(?:please\s+)?(?:remember|store|save|note(?:\s+down)?|make\s+(?:a\s+)?note|don'?t\s+forget|keep\s+(?:in\s+mind|track\s+of)|remind\s+me\s+(?:about|that)|memorize|file\s+(?:this|that)\s+away|write\s+(?:this|that)\s+down)\b/i;
+
+export function detectExplicitMemoryIntent(userMessage: string): boolean {
+  return EXPLICIT_MEMORY_PATTERN.test(userMessage);
 }
 
 function buildRetrievalQuery(
@@ -261,6 +280,10 @@ export async function* chat(
   const startTime = Date.now();
   log("info", "chat.start", { cid: conversationId, msgLen: userMessage.length, histLen: history.length });
 
+  // Compute once and reuse — metadata event, gate-bypass injection, and the
+  // done event all reference it.
+  const explicitMemoryIntent = detectExplicitMemoryIntent(userMessage);
+
   let recallResult = { count: 0, signals: {} as Record<string, unknown>, totalMs: 0, memories: [] as Array<{ id: string }> };
   let retrieveMs = 0;
   let degraded = false;
@@ -346,6 +369,10 @@ export async function* chat(
       memory_available: memoryClient.isAvailable,
       degraded,
       signals: recallResult.signals,
+      // Phase 2D: surfaces to the UI that this turn carries explicit store
+      // intent, so a missing memory_remember + missing acknowledgement can be
+      // flagged immediately instead of being noticed days later.
+      explicit_memory_intent: explicitMemoryIntent,
       kernel: {
         active: kernelLoad.active,
         tier: kernelLoad.tier,
@@ -362,18 +389,34 @@ export async function* chat(
     args: Record<string, unknown>;
     result: string;
   }> = [];
+  /** Track memory_remember outcomes this turn for the `done` event + UI. */
+  const memoryStoreResults: Array<{
+    content: string;
+    stored: boolean;
+    id?: string;
+    reason?: string;
+    kind?: string;
+    explicit?: boolean;
+  }> = [];
 
   try {
-    const tools = getAllTools();
+    const allTools = getAllTools();
+    const memoryOnlyTools = getMemoryTools();
 
     for (let round = 0; round <= config.maxToolRounds; round++) {
       const contextChars = estimateContextChars(messages);
       const contextExceeded = contextChars > config.maxContextChars;
-      const includeTools = round < config.maxToolRounds && !contextExceeded;
+      const optionalAvailable = round < config.maxToolRounds && !contextExceeded;
+      // Phase 2B carve-out: memory tools are NEVER dropped by the context guard
+      // or the final-round cutoff. A late memory_remember used to silently
+      // vanish — now it always has a tool surface to land on. Optional tools
+      // (web_research, vault_*) still respect the limits.
+      const turnTools = optionalAvailable ? allTools : memoryOnlyTools;
+      const includeTools = turnTools.length > 0;
 
       if (contextExceeded && round < config.maxToolRounds) {
         console.warn(
-          `[noah] Context size ${contextChars} chars exceeds limit ${config.maxContextChars}, forcing final round`,
+          `[noah] Context size ${contextChars} chars exceeds limit ${config.maxContextChars}, dropping optional tools (memory tools still active)`,
         );
         log("warn", "context.limit", { cid: conversationId, chars: contextChars, max: config.maxContextChars, round });
         yield {
@@ -389,7 +432,7 @@ export async function* chat(
 
       const modelStart = Date.now();
       const response = await modelClient.chat(messages, {
-        tools: includeTools ? tools : undefined,
+        tools: includeTools ? turnTools : undefined,
       });
       log("info", "model.response", { cid: conversationId, round, ms: Date.now() - modelStart, contentLen: response.content.length, toolCalls: response.tool_calls.length });
 
@@ -441,6 +484,14 @@ export async function* chat(
         });
 
         for (const n of normalized) {
+          // Phase 2D: inject explicit=true when the user's message had clear
+          // store intent. The MCP server then bypasses the worthiness gate so
+          // an explicit "remember this short fact" can't be silently dropped
+          // for being too short or near-duplicate.
+          if (n.name === "memory_remember" && explicitMemoryIntent) {
+            n.args.explicit = true;
+          }
+
           yield { type: "tool_call", data: JSON.stringify({ name: n.name, args: n.args }) };
 
           let result: string;
@@ -465,6 +516,31 @@ export async function* chat(
             }
           }
           toolCallsMade.push({ name: n.name, args: n.args, result });
+
+          // Phase 2A verification: parse memory_remember results and track
+          // each store outcome. Failed writes surface in the done event so the
+          // UI can show a clear "store failed" badge instead of letting the
+          // model's optimistic "stored" land uncontested.
+          if (n.name === "memory_remember") {
+            try {
+              const parsed = JSON.parse(result) as Record<string, unknown>;
+              memoryStoreResults.push({
+                content: typeof n.args.content === "string" ? n.args.content : "",
+                stored: parsed.stored === true,
+                id: parsed.id as string | undefined,
+                reason: parsed.reason as string | undefined,
+                kind: parsed.kind as string | undefined,
+                explicit: parsed.explicit as boolean | undefined,
+              });
+            } catch {
+              memoryStoreResults.push({
+                content: typeof n.args.content === "string" ? n.args.content : "",
+                stored: false,
+                kind: "unparseable",
+                reason: "Tool result was not valid JSON",
+              });
+            }
+          }
 
           messages.push({
             role: "tool",
@@ -553,11 +629,25 @@ export async function* chat(
 
   const totalMs = Date.now() - startTime;
   log("info", "chat.done", { cid: conversationId, ms: totalMs, toolCalls: toolCallsMade.length, degraded, provider: config.provider });
+  // Phase 2A: Surface memory store outcomes in the done event. If any store
+  // failed AND the user expressed explicit intent, also log a warning so the
+  // failure is visible in the structured log, not just the SSE payload.
+  const storeFailures = memoryStoreResults.filter((r) => !r.stored);
+  if (storeFailures.length > 0 && explicitMemoryIntent) {
+    log("warn", "memory.write.explicit_fail", {
+      cid: conversationId,
+      failures: storeFailures.length,
+      sample_reason: storeFailures[0]?.reason,
+    });
+  }
+
   yield {
     type: "done",
     data: JSON.stringify({
       tool_calls: toolCallsMade,
       total_ms: totalMs,
+      memory_stores: memoryStoreResults,
+      explicit_memory_intent: explicitMemoryIntent,
       provenance: {
         model: config.provider,
         model_id:

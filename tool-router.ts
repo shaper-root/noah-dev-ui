@@ -240,6 +240,16 @@ export function getAllTools(): ToolDef[] {
   return tools;
 }
 
+/**
+ * Memory tools only. Used by noah.ts as the "always available" carve-out so a
+ * memory_remember call is never silently dropped by the context/round guard
+ * (Phase 2B): the worst-case behavior is one extra round whose work the forced-
+ * final completion absorbs into plain text, NOT a lost write.
+ */
+export function getMemoryTools(): ToolDef[] {
+  return [...MEMORY_TOOLS];
+}
+
 export async function dispatchTool(
   call: ToolCall,
 ): Promise<string> {
@@ -260,6 +270,18 @@ export async function dispatchTool(
 
   switch (name) {
     case "memory_remember": {
+      // Auto-fill provenance: every stored memory carries the model that wrote
+      // it. Uses the existing `source_ref` column (no schema change). Format is
+      // "model:<provider>:<model_id>" so future trust gates can key on it.
+      const modelId =
+        config.provider === "local" ? config.ollama.model : config.cloud.model;
+      const sourceRef = `model:${config.provider}:${modelId}`;
+
+      // `explicit` is injected into the tool args by noah.ts when the user's
+      // message expresses an unambiguous "remember this" intent. The MCP server
+      // then bypasses the worthiness gate for the write.
+      const explicit = args.explicit === true;
+
       const result = await memoryClient.remember(args.content, {
         type: args.type,
         category: args.category,
@@ -267,8 +289,24 @@ export async function dispatchTool(
         entities: args.entities,
         keywords: args.keywords,
         supersedes: args.supersedes,
+        sourceRef,
+        explicit,
       });
-      return JSON.stringify(result ?? { error: "Memory unavailable" });
+      // ALWAYS a structured object now — never the legacy "Memory unavailable"
+      // string. On failure, attach an explicit advisory so the model cannot
+      // silently claim "stored" when the write was rejected or unavailable.
+      if (!result.stored) {
+        return JSON.stringify({
+          ...result,
+          _agent_advisory:
+            "Memory write FAILED. Do NOT tell the user it was stored. " +
+            "Acknowledge the failure honestly: 'I tried to store that, but the " +
+            "write failed (" +
+            (result.kind ?? "unknown") +
+            "). Tell me again next session if it matters.' Then proceed.",
+        });
+      }
+      return JSON.stringify(result);
     }
 
     case "memory_recall": {

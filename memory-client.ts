@@ -40,9 +40,16 @@ export interface RecalledMemory {
 
 export interface RememberResult {
   stored: boolean;
-  id: string;
-  confidence: number;
-  embedded: boolean;
+  /** Memory UUID when stored=true; undefined when stored=false. */
+  id?: string;
+  confidence?: number;
+  embedded?: boolean;
+  /** True when explicit=true was passed (gate bypassed). */
+  explicit?: boolean;
+  /** When stored=false: rejection reason from the memory-api. */
+  reason?: string;
+  /** When stored=false: failure category. */
+  kind?: 'gate_reject' | 'source_auth' | 'unavailable' | 'timeout' | 'unknown';
 }
 
 export interface RecallResult {
@@ -340,9 +347,23 @@ class MemoryClient {
       entities?: string[];
       keywords?: string[];
       supersedes?: string;
+      /** Provenance for the writer — e.g. "model:cloud:deepseek-v4-flash". */
+      sourceRef?: string;
+      /** When true, MCP skips the worthiness gate (user explicitly asked to remember). */
+      explicit?: boolean;
     },
-  ): Promise<RememberResult | null> {
-    if (!(await this.ensureConnected())) return null;
+  ): Promise<RememberResult> {
+    // ALWAYS return a structured result — never null. The agent must be able to
+    // verify whether a write happened; null silently degrades to "Memory
+    // unavailable" downstream and the agent then claims "stored" anyway.
+    if (!(await this.ensureConnected())) {
+      log("warn", "memory.write.unavailable", {});
+      return {
+        stored: false,
+        kind: "unavailable",
+        reason: "MCP child not connected",
+      };
+    }
 
     try {
       const result = await withTimeout(
@@ -356,24 +377,69 @@ class MemoryClient {
             ...(opts?.entities && { entities: opts.entities }),
             ...(opts?.keywords && { keywords: opts.keywords }),
             ...(opts?.supersedes && { supersedes: opts.supersedes }),
+            ...(opts?.sourceRef && { source_ref: opts.sourceRef }),
+            ...(opts?.explicit && { explicit: true }),
           },
         }),
         config.mcpToolTimeoutMs,
         "memory_remember",
       );
 
+      const parsed = parseMcpResult(result) as Record<string, unknown>;
+
       if (result.isError) {
-        console.warn("[memory] remember rejected:", parseMcpResult(result));
-        return null;
+        // The MCP server now returns a structured JSON body inside the error
+        // content (Phase 2A) — pass it through so the agent can act on it.
+        console.warn("[memory] remember rejected:", parsed);
+        const kind =
+          (parsed.kind as RememberResult["kind"]) ??
+          "unknown";
+        log("warn", "memory.write.reject", {
+          kind,
+          reason: parsed.reason,
+        });
+        return {
+          stored: false,
+          kind,
+          reason:
+            (parsed.reason as string) ??
+            (parsed.raw as string) ??
+            "Memory rejected by API",
+        };
       }
 
-      return parseMcpResult(result) as RememberResult;
+      const ok = parsed as Partial<RememberResult>;
+      if (!ok.stored || !ok.id) {
+        // Defensive: success path should always include stored=true + id.
+        log("warn", "memory.write.malformed", { parsed });
+        return {
+          stored: false,
+          kind: "unknown",
+          reason: "Memory API returned a malformed success response",
+        };
+      }
+
+      log("info", "memory.write.ok", {
+        id: ok.id,
+        explicit: !!ok.explicit,
+        embedded: ok.embedded,
+      });
+      return {
+        stored: true,
+        id: ok.id,
+        confidence: ok.confidence,
+        embedded: ok.embedded,
+        explicit: ok.explicit,
+      };
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
       console.warn("[memory] remember failed:", err);
+      log("error", "memory.write.fail", { err: msg });
       if (err instanceof Error && err.message.includes("timed out")) {
         this.forceDisconnect();
+        return { stored: false, kind: "timeout", reason: msg };
       }
-      return null;
+      return { stored: false, kind: "unknown", reason: msg };
     }
   }
 
