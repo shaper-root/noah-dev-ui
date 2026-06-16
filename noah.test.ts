@@ -200,4 +200,77 @@ describe("agent loop resilience", () => {
     expect(done.provenance.degraded).toBe(false);
     expect(done.provenance.model).toBe("cloud");
   });
+
+  test("malformed tool-call arguments do not crash the turn (#3)", async () => {
+    mockGetAllTools.mockReturnValue([
+      {
+        type: "function",
+        function: { name: "memory_recall", description: "search", parameters: {} },
+      },
+    ]);
+    mockModelChat
+      .mockResolvedValueOnce({
+        content: "",
+        // arguments is a malformed JSON string (missing closing brace) — this is
+        // the shape that previously threw OUTSIDE the per-tool try/catch.
+        tool_calls: [
+          { id: "c1", function: { name: "memory_recall", arguments: '{"query": "values"' } },
+        ],
+        thinking: "",
+      })
+      .mockResolvedValueOnce({ content: "Here is what I found.", tool_calls: [], thinking: "" });
+
+    const events = await collect(chat("search your memory for values", "argerr-1", []));
+    expect(events.some((e: ChatEvent) => e.type === "error")).toBe(false);
+    expect(events.some((e: ChatEvent) => e.type === "token")).toBe(true);
+    // The unparseable call must be turned into a tool-error result, not dispatched.
+    expect(mockDispatchTool).not.toHaveBeenCalled();
+  });
+
+  test("forces a final answer when the model ends on tool-only output (#4)", async () => {
+    testConfig.maxToolRounds = 1; // round 0 has tools; round 1 (final) does not
+    mockGetAllTools.mockReturnValue([
+      {
+        type: "function",
+        function: { name: "memory_recall", description: "search", parameters: {} },
+      },
+    ]);
+    mockDispatchTool.mockResolvedValue(JSON.stringify({ count: 0, memories: [] }));
+
+    let n = 0;
+    mockModelChat.mockImplementation(async () => {
+      n++;
+      if (n === 1)
+        return {
+          content: "",
+          tool_calls: [{ id: "c1", function: { name: "memory_recall", arguments: { query: "x" } } }],
+          thinking: "",
+        };
+      if (n === 2)
+        // final round: tools disabled, but the model still emits a tool call + empty content
+        return {
+          content: "",
+          tool_calls: [{ id: "c2", function: { name: "memory_recall", arguments: { query: "y" } } }],
+          thinking: "",
+        };
+      return { content: "Final forced answer.", tool_calls: [], thinking: "" };
+    });
+
+    const events = await collect(chat("what are my values", "final-1", []));
+    const token = events.find((e: ChatEvent) => e.type === "token");
+    expect(token).toBeDefined();
+    expect(token!.data).toContain("Final forced answer.");
+    expect(events.some((e: ChatEvent) => e.type === "error")).toBe(false);
+  });
+
+  test("maps raw provider errors to friendly text (keeps status code)", async () => {
+    mockModelChat.mockRejectedValueOnce(new Error("Cloud 401: {\"error\":\"bad key\"}"));
+    const events = await collect(chat("hello", "fe-1", []));
+    const err = events.find((e: ChatEvent) => e.type === "error");
+    expect(err).toBeDefined();
+    expect(err!.data).toContain("authentication");
+    expect(err!.data).toContain("401");
+    // raw JSON body must not leak to the user
+    expect(err!.data).not.toContain("bad key");
+  });
 });

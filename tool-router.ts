@@ -187,10 +187,19 @@ export async function dispatchTool(
   call: ToolCall,
 ): Promise<string> {
   const name = call.function.name;
-  const args =
-    typeof call.function.arguments === "string"
-      ? JSON.parse(call.function.arguments)
-      : call.function.arguments;
+  // Defensive: callers (noah.ts) normally pass an already-parsed object. If a
+  // raw string slips through, parse it safely — never throw out of dispatch.
+  const rawArgs = call.function.arguments;
+  let args: Record<string, any>;
+  if (typeof rawArgs === "string") {
+    try {
+      args = JSON.parse(rawArgs || "{}");
+    } catch {
+      args = {};
+    }
+  } else {
+    args = (rawArgs as Record<string, any>) ?? {};
+  }
 
   switch (name) {
     case "memory_remember": {

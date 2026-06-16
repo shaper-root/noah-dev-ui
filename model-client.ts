@@ -153,6 +153,15 @@ class CloudClient implements ModelClient {
       stream: false,
     };
 
+    // Bound the response and control hidden reasoning (see config.cloud). These
+    // are the levers that keep the reasoning-model cloud path inside the timeout.
+    if (config.cloud.maxTokens > 0) {
+      body.max_tokens = config.cloud.maxTokens;
+    }
+    if (config.cloud.reasoningEffort) {
+      body.reasoning_effort = config.cloud.reasoningEffort;
+    }
+
     if (opts?.tools?.length) {
       body.tools = opts.tools;
     }

@@ -27,6 +27,15 @@ export const config = {
     model: env("NOAH_CLOUD_MODEL", "accounts/fireworks/models/qwen3p6-plus"),
     promptCache: (process.env.FIREWORKS_PROMPT_CACHE || "false") === "true",
     timeoutMs: envInt("NOAH_CLOUD_TIMEOUT_MS", 60_000),
+    // Bound the cloud completion. Reasoning models (e.g. qwen3p6-plus) emit long
+    // hidden reasoning; without a cap a single round can run ~50s and a multi-round
+    // turn blows the timeout. 0 = omit (provider default).
+    maxTokens: envInt("NOAH_CLOUD_MAX_TOKENS", 2048),
+    // Controls hidden reasoning for reasoning-capable cloud models. "none" disables
+    // it (~1s responses, verified for qwen3p6-plus on Fireworks) — the reliability
+    // default. Set "low"/"medium"/"high" for deeper reasoning (raise
+    // NOAH_CLOUD_TIMEOUT_MS to match), or "" to omit the param (provider default).
+    reasoningEffort: env("NOAH_CLOUD_REASONING_EFFORT", "none"),
   },
 
   memory: {

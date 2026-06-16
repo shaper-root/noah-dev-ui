@@ -207,6 +207,16 @@ class MemoryClient {
         this.lastFail = Date.now();
       };
 
+      // Wire transport errors for visibility (previously unset → stdout-parse and
+      // read errors were silently swallowed). A transient parse error does not by
+      // itself down the client; a real stream death triggers onclose above.
+      this.transport.onerror = (err: Error) => {
+        console.warn("[memory] MCP transport error:", err);
+        log("error", "mcp.transport.error", {
+          err: err instanceof Error ? err.message : String(err),
+        });
+      };
+
       await this.client.connect(this.transport);
       this.available = true;
       console.warn("[memory] Connected to MCP server");
@@ -221,6 +231,25 @@ class MemoryClient {
       throw err;
     } finally {
       this.connecting = false;
+    }
+  }
+
+  /**
+   * Spawn + complete the MCP initialize handshake at server boot so the first
+   * user turn does not pay the node+tsx cold-start cost (the #1 first-message
+   * race). Bounded by `timeoutMs` and never throws — on failure the client falls
+   * back to lazy connect on first recall.
+   */
+  async warmup(timeoutMs = 20_000): Promise<boolean> {
+    try {
+      await withTimeout(this.connect(), timeoutMs, "memory warmup");
+      return !!this.client;
+    } catch (err) {
+      console.warn("[memory] Warmup failed (will retry lazily):", err);
+      log("warn", "mcp.warmup.fail", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return false;
     }
   }
 

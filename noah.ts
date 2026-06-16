@@ -143,8 +143,8 @@ function extractJsonObject(text: string, start: number): string | null {
   return null;
 }
 
-const TOOL_NAME_PATTERN =
-  /"name"\s*:\s*"(memory_remember|memory_recall|memory_forget|memory_inspect|web_research)"/g;
+const TOOL_NAME_SOURCE =
+  '"name"\\s*:\\s*"(memory_remember|memory_recall|memory_forget|memory_inspect|web_research)"';
 
 function parseToolCalls(message: {
   content?: string;
@@ -158,10 +158,12 @@ function parseToolCalls(message: {
   if (!content) return [];
 
   const parsed: ToolCall[] = [];
+  // Fresh regex per call: a module-level /g regex shares lastIndex across
+  // concurrent chat() generators (reentrancy corruption under rapid-fire).
+  const pattern = new RegExp(TOOL_NAME_SOURCE, "g");
   let match: RegExpExecArray | null;
-  TOOL_NAME_PATTERN.lastIndex = 0;
 
-  while ((match = TOOL_NAME_PATTERN.exec(content)) !== null) {
+  while ((match = pattern.exec(content)) !== null) {
     let pos = match.index;
     while (pos > 0 && content[pos] !== "{") pos--;
     if (content[pos] === "{") {
@@ -188,6 +190,39 @@ function stripThinking(text: string): string {
     .replace(/<think>[\s\S]*?<\/think>/g, "")
     .replace(/\/no_think\s*/g, "")
     .trim();
+}
+
+/**
+ * Map a raw provider/transport error to a concise, user-facing message. The raw
+ * detail (which can be a large JSON body) is logged server-side; the user sees
+ * something actionable. Status codes are preserved in the text for transparency.
+ */
+function friendlyModelError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const lower = raw.toLowerCase();
+  if (lower.includes("timed out") || lower.includes("abort")) {
+    return "The model took too long to respond and timed out. Try again, ask something simpler, or switch between local and cloud.";
+  }
+  const status = raw.match(/\b(400|401|403|404|429|5\d\d)\b/)?.[1];
+  if (status === "401" || status === "403") {
+    return `The cloud model rejected the request — authentication failed (${status}). Check the API key.`;
+  }
+  if (status === "429") {
+    return "The cloud model is rate-limited right now (429). Wait a moment and try again.";
+  }
+  if (status === "400") {
+    return "The cloud model rejected the request as malformed (400).";
+  }
+  if (status === "404") {
+    return "The configured cloud model was not found (404). Check the model name.";
+  }
+  if (status && status.startsWith("5")) {
+    return `The model service is temporarily unavailable (${status}). Try again shortly.`;
+  }
+  if (lower.includes("fetch") || lower.includes("econnrefused") || lower.includes("connection")) {
+    return "Couldn't reach the model service. Is Ollama (local) running, or the network (cloud) reachable?";
+  }
+  return `The model encountered an error: ${raw.slice(0, 200)}`;
 }
 
 export interface ChatEvent {
@@ -278,6 +313,7 @@ export async function* chat(
   };
 
   let responseText = "";
+  let toolCallSeq = 0; // turn-local, for minting stable tool-call ids
   const toolCallsMade: Array<{
     name: string;
     args: Record<string, unknown>;
@@ -320,50 +356,82 @@ export async function* chat(
       });
 
       if (toolCalls.length > 0 && includeTools) {
-        const assistantMsg: Message = {
-          role: "assistant",
-          content: response.content,
-          tool_calls: response.tool_calls.length > 0
-            ? response.tool_calls
-            : toolCalls,
-        };
-        messages.push(assistantMsg);
-
-        for (const tc of toolCalls) {
+        // Normalize every tool call BEFORE doing anything that can fail:
+        //  - mint a stable id when the model text-emitted the call (so the
+        //    assistant.tool_calls id and the tool message's tool_call_id always
+        //    pair — required by the OpenAI/Fireworks chat-completions contract),
+        //  - parse `arguments` exactly ONCE, here, inside a guard. A malformed
+        //    arguments string becomes a tool-level error fed back to the model,
+        //    never a turn-ending throw. (The previous code ran JSON.parse OUTSIDE
+        //    the per-tool try/catch — the root cause of the explicit-recall crash.)
+        const normalized = toolCalls.map((tc) => {
+          const id = tc.id || `call_${conversationId}_${++toolCallSeq}`;
           const name = tc.function.name;
-          const args =
-            typeof tc.function.arguments === "string"
-              ? JSON.parse(tc.function.arguments)
-              : tc.function.arguments;
+          const raw = tc.function.arguments;
+          let args: Record<string, unknown> = {};
+          let argError = false;
+          if (typeof raw === "string") {
+            const trimmed = raw.trim();
+            if (trimmed) {
+              try {
+                args = JSON.parse(trimmed) as Record<string, unknown>;
+              } catch {
+                argError = true;
+              }
+            }
+          } else if (raw && typeof raw === "object") {
+            args = raw as Record<string, unknown>;
+          }
+          return { id, name, args, argError };
+        });
 
-          yield { type: "tool_call", data: JSON.stringify({ name, args }) };
+        // Assistant turn carries normalized tool_calls (object args, stable ids)
+        // and thinking-stripped content so <think> blocks don't re-enter context
+        // on later rounds.
+        messages.push({
+          role: "assistant",
+          content: stripThinking(response.content),
+          tool_calls: normalized.map((n) => ({
+            id: n.id,
+            function: { name: n.name, arguments: n.args },
+          })),
+        });
+
+        for (const n of normalized) {
+          yield { type: "tool_call", data: JSON.stringify({ name: n.name, args: n.args }) };
 
           let result: string;
           const toolStart = Date.now();
-          try {
-            result = await dispatchTool(tc);
-            log("info", "tool.ok", { cid: conversationId, name, ms: Date.now() - toolStart });
-          } catch (toolErr) {
-            console.warn(`[noah] Tool ${name} failed:`, toolErr);
-            result = JSON.stringify({ error: `Tool ${name} failed: ${toolErr instanceof Error ? toolErr.message : String(toolErr)}` });
-            log("warn", "tool.fail", { cid: conversationId, name, ms: Date.now() - toolStart, err: toolErr instanceof Error ? toolErr.message : String(toolErr) });
+          if (n.argError) {
+            result = JSON.stringify({
+              error: `Could not parse arguments for ${n.name}. Provide valid JSON arguments.`,
+            });
+            log("warn", "tool.argparse_fail", { cid: conversationId, name: n.name });
+          } else {
+            try {
+              // Pass the already-parsed object so dispatchTool does not re-parse.
+              result = await dispatchTool({
+                id: n.id,
+                function: { name: n.name, arguments: n.args },
+              });
+              log("info", "tool.ok", { cid: conversationId, name: n.name, ms: Date.now() - toolStart });
+            } catch (toolErr) {
+              console.warn(`[noah] Tool ${n.name} failed:`, toolErr);
+              result = JSON.stringify({ error: `Tool ${n.name} failed: ${toolErr instanceof Error ? toolErr.message : String(toolErr)}` });
+              log("warn", "tool.fail", { cid: conversationId, name: n.name, ms: Date.now() - toolStart, err: toolErr instanceof Error ? toolErr.message : String(toolErr) });
+            }
           }
-          toolCallsMade.push({ name, args, result });
+          toolCallsMade.push({ name: n.name, args: n.args, result });
 
           messages.push({
             role: "tool",
             content: result,
-            ...(tc.id ? { tool_call_id: tc.id } : {}),
+            tool_call_id: n.id,
           });
 
-          if (
-            name === "memory_remember" &&
-            (args as Record<string, unknown>).type === "feedback"
-          ) {
+          if (n.name === "memory_remember" && n.args.type === "feedback") {
             const corrections = sessionCorrections.get(conversationId) || [];
-            corrections.push(
-              (args as Record<string, unknown>).content as string,
-            );
+            corrections.push(n.args.content as string);
             if (corrections.length > MAX_CORRECTIONS) {
               corrections.splice(0, corrections.length - MAX_CORRECTIONS);
             }
@@ -377,14 +445,38 @@ export async function* chat(
       break;
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error("[noah] Model error:", message);
-    log("error", "chat.error", { cid: conversationId, ms: Date.now() - startTime, err: message });
-    yield { type: "error", data: message };
+    const raw = err instanceof Error ? err.message : String(err);
+    console.error("[noah] Model error:", raw);
+    log("error", "chat.error", { cid: conversationId, ms: Date.now() - startTime, err: raw });
+    yield { type: "error", data: friendlyModelError(err) };
     return;
   }
 
   responseText = stripThinking(responseText);
+
+  // Safety net: the model can end the final (tools-disabled) round having emitted
+  // only tool calls / empty content. Rather than silently fall back to a canned
+  // line, force ONE plain-text completion using the context already gathered.
+  if (!responseText.trim()) {
+    try {
+      const forced = await modelClient.chat(
+        [
+          ...messages,
+          {
+            role: "user",
+            content:
+              "Answer now in plain text using the information you already have. Do not call any tools.",
+          },
+        ],
+        {},
+      );
+      responseText = stripThinking(forced.content);
+      log("info", "chat.forced_final", { cid: conversationId, len: responseText.length });
+    } catch (err) {
+      log("warn", "chat.forced_final_fail", { cid: conversationId, err: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
   if (!responseText) {
     responseText = "I'm not sure how to respond to that.";
   }

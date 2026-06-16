@@ -1,7 +1,8 @@
 import { Hono } from "hono";
 import { DB } from "./db";
-import { config } from "./config";
+import { config, validateConfig } from "./config";
 import { chat } from "./noah";
+import { memoryClient } from "./memory-client";
 import {
   extractText,
   classifyFile,
@@ -562,6 +563,38 @@ console.log(`
   Ollama:      http://127.0.0.1:11434
   noah-memory: http://127.0.0.1:6789
 `);
+
+// --- Startup readiness gate ---
+// Validate required config (fail fast on missing env), then warm the MCP memory
+// child so the FIRST user turn doesn't pay node+tsx cold-start cost (the #1
+// first-message race). warmup() is bounded and never throws — if memory is down
+// the server still boots and recall degrades gracefully.
+validateConfig();
+await memoryClient.warmup();
+
+// Warm the local chat model so the FIRST user turn doesn't pay cold-load latency
+// (~10s to page qwen3.5:4b into VRAM). Best-effort and bounded; cloud has no
+// cold-load so it's skipped. Off the user path — runs once at boot.
+if (config.provider === "local") {
+  try {
+    await fetch(`${config.ollama.url}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: config.ollama.model,
+        messages: [{ role: "user", content: "hi" }],
+        stream: false,
+        options: { num_ctx: config.ollama.numCtx },
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    console.log("[noah] Chat model warm");
+  } catch (err) {
+    console.warn("[noah] Chat model warmup skipped:", err instanceof Error ? err.message : err);
+  }
+}
+
+console.log("[noah] Startup warmup complete; serving on :" + PORT);
 
 export default {
   port: PORT,
