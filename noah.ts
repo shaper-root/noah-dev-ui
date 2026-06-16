@@ -205,7 +205,12 @@ function friendlyModelError(err: unknown): string {
   if (lower.includes("timed out") || lower.includes("abort")) {
     return "The model took too long to respond and timed out. Try again, ask something simpler, or switch between local and cloud.";
   }
-  const status = raw.match(/\b(400|401|403|404|429|5\d\d)\b/)?.[1];
+  // Anchor to the provider-error prefix first ("Cloud 401: ...", "Ollama 500: ...")
+  // so a status-like number inside the response body can't be misclassified;
+  // fall back to a loose scan only if there's no recognized prefix.
+  const status =
+    raw.match(/^(?:Cloud|Ollama)\s+(\d{3})\b/)?.[1] ??
+    raw.match(/\b(400|401|403|404|429|5\d\d)\b/)?.[1];
   if (status === "401" || status === "403") {
     return `The cloud model rejected the request — authentication failed (${status}). Check the API key.`;
   }
@@ -266,23 +271,28 @@ export async function* chat(
   }
 
   let kernelResult = { processedMessage: userMessage, processedMemories: [] as unknown[] };
+  let kernelTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     // Bound kernel.process now (while it's passthrough) so a future non-passthrough
-    // kernel can never hang a turn — degrade to the raw message on timeout.
+    // kernel can never hang a turn — degrade to the raw message on timeout. The
+    // timer is cleared in finally so a fast (passthrough) kernel doesn't leave a
+    // dangling timeout that later rejects unhandled.
     kernelResult = await Promise.race([
       kernel.process({
         userMessage,
         memories: (recallResult as { memories: unknown[] }).memories,
         conversationHistory: history,
       }),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("kernel timed out")), KERNEL_TIMEOUT_MS),
-      ),
+      new Promise<never>((_, reject) => {
+        kernelTimer = setTimeout(() => reject(new Error("kernel timed out")), KERNEL_TIMEOUT_MS);
+      }),
     ]) as typeof kernelResult;
   } catch (err) {
     console.warn("[noah] Kernel processing failed, using raw message:", err);
     log("warn", "kernel.fail", { cid: conversationId, err: err instanceof Error ? err.message : String(err) });
     degraded = true;
+  } finally {
+    if (kernelTimer) clearTimeout(kernelTimer);
   }
 
   const now = new Date();
@@ -459,7 +469,12 @@ export async function* chat(
         continue;
       }
 
-      responseText = response.content;
+      // No tools to run this round. If the model emitted tool calls but tools
+      // were disabled (the final round), its content is tool-call JSON, not an
+      // answer — blank it so the forced-final safety net below produces real
+      // prose instead of showing a raw {"name":...} blob to the user. (Covers
+      // both native tool_calls and text-emitted JSON parsed from content.)
+      responseText = toolCalls.length > 0 ? "" : response.content;
       break;
     }
   } catch (err) {

@@ -170,9 +170,12 @@ app.post("/api/chat", async (c) => {
         // already JSON object strings.
         const send = (event: SSEEventName, data: string) => write(formatSSE(event, data));
 
-        // SSE keepalive: comment line every 10s prevents idle-timeout on
-        // intermediate proxies and browsers during long model responses.
-        const keepalive = setInterval(() => write(formatSSEComment("keepalive")), 10_000);
+        // SSE keepalive: comment line every 5s feeds the connection during long
+        // model responses. MUST stay comfortably below the server idleTimeout
+        // (set to 255s on the default export) — a keepalive interval equal to the
+        // idle timeout races it and the connection dies mid-stream (the
+        // metadata-only truncation bug on slow/cold turns).
+        const keepalive = setInterval(() => write(formatSSEComment("keepalive")), 5_000);
 
         // Send conversation ID first (for new conversations)
         send("conversation_id", conversationId!);
@@ -570,36 +573,41 @@ console.log(`
 // first-message race). warmup() is bounded and never throws — if memory is down
 // the server still boots and recall degrades gracefully.
 validateConfig();
+// Await the MCP memory handshake — it's fast (~1-2s) and ensures memory is ready
+// for the first turn (the #1 race). Do NOT await the chat-model warm below: it can
+// take ~30s and would delay port binding past the launcher's health-check window
+// (Bun binds the port only after this module finishes evaluating). Lazy first-token
+// model load is acceptable, and slow turns now survive (idleTimeout=255).
 await memoryClient.warmup();
 
-// Warm the local chat model so the FIRST user turn doesn't pay cold-load latency
-// (~10s to page qwen3.5:4b into VRAM). Best-effort and bounded; cloud has no
-// cold-load so it's skipped. Off the user path — runs once at boot.
+// Fire-and-forget local chat-model warm (pages qwen3.5:4b into VRAM in the
+// background so the first user turn is fast). Cloud has no cold-load — skipped.
 if (config.provider === "local") {
-  try {
-    await fetch(`${config.ollama.url}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: config.ollama.model,
-        messages: [{ role: "user", content: "hi" }],
-        stream: false,
-        options: { num_ctx: config.ollama.numCtx },
-      }),
-      signal: AbortSignal.timeout(30_000),
-    });
-    console.log("[noah] Chat model warm");
-  } catch (err) {
-    console.warn("[noah] Chat model warmup skipped:", err instanceof Error ? err.message : err);
-  }
+  void fetch(`${config.ollama.url}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: config.ollama.model,
+      messages: [{ role: "user", content: "hi" }],
+      stream: false,
+      options: { num_ctx: config.ollama.numCtx },
+    }),
+    signal: AbortSignal.timeout(30_000),
+  })
+    .then(() => console.log("[noah] Chat model warm"))
+    .catch((err) => console.warn("[noah] Chat model warmup skipped:", err instanceof Error ? err.message : err));
 }
 
-console.log("[noah] Startup warmup complete; serving on :" + PORT);
+console.log("[noah] Startup gate complete (memory ready); serving on :" + PORT);
 
 export default {
   port: PORT,
   hostname: "127.0.0.1",
   development: false,
+  // SSE turns can be silent for longer than Bun's 10s default idle timeout
+  // (cold model load, long answers, multi-tool rounds). Raise to the max so the
+  // connection is never killed mid-generation; keepalives (5s) feed it regardless.
+  idleTimeout: 255,
   async fetch(req: Request) {
     const url = new URL(req.url);
     console.log(`[server] ${req.method} ${url.pathname}`);

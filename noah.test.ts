@@ -273,4 +273,38 @@ describe("agent loop resilience", () => {
     // raw JSON body must not leak to the user
     expect(err!.data).not.toContain("bad key");
   });
+
+  test("does not leak raw tool-call JSON when the model text-emits it on the final round", async () => {
+    testConfig.maxToolRounds = 1; // round 0 has tools; round 1 (final) does not
+    mockGetAllTools.mockReturnValue([
+      {
+        type: "function",
+        function: { name: "memory_recall", description: "search", parameters: {} },
+      },
+    ]);
+    mockDispatchTool.mockResolvedValue(JSON.stringify({ count: 0, memories: [] }));
+
+    let n = 0;
+    mockModelChat.mockImplementation(async () => {
+      n++;
+      if (n === 1)
+        return {
+          content: "",
+          tool_calls: [{ id: "c1", function: { name: "memory_recall", arguments: { query: "x" } } }],
+          thinking: "",
+        };
+      if (n === 2)
+        // FINAL round, tools disabled: model TEXT-EMITS a tool call as JSON in
+        // content (qwen3.5 does this). It must NOT be shown to the user as prose.
+        return { content: '{"name":"memory_recall","arguments":{"query":"values"}}', tool_calls: [], thinking: "" };
+      return { content: "Here is a real answer.", tool_calls: [], thinking: "" };
+    });
+
+    const events = await collect(chat("what are my values", "finaljson-1", []));
+    const token = events.find((e: ChatEvent) => e.type === "token");
+    expect(token).toBeDefined();
+    expect(token!.data).toContain("Here is a real answer.");
+    expect(token!.data).not.toContain('"name"'); // raw tool-call JSON must not leak
+    expect(events.some((e: ChatEvent) => e.type === "error")).toBe(false);
+  });
 });

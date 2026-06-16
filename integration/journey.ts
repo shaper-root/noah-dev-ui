@@ -36,6 +36,13 @@ function arg(name: string, fallback: string): string {
   return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 }
 
+/** A valid answer is prose, not a raw tool-call JSON blob leaking to the user. */
+function looksLikeToolJson(text: string): boolean {
+  const t = text.trim();
+  if (!t.startsWith("{") && !t.startsWith("[")) return false;
+  return /"name"\s*:\s*"(memory_remember|memory_recall|memory_forget|memory_inspect|web_research)"/.test(t);
+}
+
 async function setMode(mode: "local" | "cloud"): Promise<boolean> {
   try {
     const res = await fetch(`${BASE}/api/mode`, {
@@ -118,6 +125,9 @@ async function runTurn(message: string, history: Msg[]): Promise<TurnResult> {
   // Acceptance: a clean completion (done + non-empty answer) OR a clear error
   // (error event with a non-empty message). Anything else is a reliability failure.
   if (sawDone && tokenText.trim().length > 0) {
+    if (looksLikeToolJson(tokenText)) {
+      return { ok: false, reason: "answer is raw tool-call JSON, not prose", ms, events, tokenText, errorMsg };
+    }
     return { ok: true, reason: "done", ms, events, tokenText, errorMsg };
   }
   if (sawError && errorMsg && errorMsg.trim().length > 0) {
@@ -153,8 +163,12 @@ async function runJourney(mode: "local" | "cloud"): Promise<{ pass: number; fail
   console.log(`\n══════════ MODE: ${mode} ══════════`);
   const switched = await setMode(mode);
   if (!switched) {
-    console.log(`  ⚠ could not switch to ${mode} (key missing?) — skipping`);
-    return { pass: 0, fail: 0, failures: [] };
+    // The mode was explicitly requested — a switch failure means it was NOT
+    // tested. Count it as a hard failure so CI can't report green with zero
+    // coverage of a requested mode (e.g. a missing cloud key).
+    const msg = `[${mode}] MODE SWITCH FAILED — mode NOT tested (key missing or Noah down)`;
+    console.log(`  ✗✗ ${msg}`);
+    return { pass: 0, fail: 1, failures: [msg] };
   }
 
   const history: Msg[] = [];
