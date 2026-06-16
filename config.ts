@@ -1,5 +1,13 @@
+import { resolve } from "path";
+
 const env = (key: string, fallback: string): string =>
   process.env[key] || fallback;
+
+const envBool = (key: string, fallback: boolean): boolean => {
+  const val = process.env[key];
+  if (val === undefined || val === "") return fallback;
+  return val !== "false" && val !== "0";
+};
 
 const envInt = (key: string, fallback: number): number => {
   const val = process.env[key];
@@ -44,6 +52,48 @@ export const config = {
     memoryApiDir: env("NOAH_MEMORY_API_DIR", ""),
   },
 
+  // Okeanos behavioral kernel (P2). The kernel text is read at startup from
+  // skillforge's deploy directory — NO copy lives in this repo, so `forge deploy`
+  // updates what Noah loads on next restart. All settings are new env vars; nothing
+  // here changes existing behavior when NOAH_KERNEL_ENABLED is left at its default.
+  kernel: {
+    // Master switch. false → passthrough (no kernel text injected), identical to
+    // pre-P2 behavior.
+    enabled: envBool("NOAH_KERNEL_ENABLED", true),
+    // full → reasoning-kernel.md (cloud). lite → reasoning-kernel-lite.md (local 4B).
+    // none → passthrough A/B baseline.
+    tier: env("NOAH_KERNEL_TIER", "full") as "full" | "lite" | "none",
+    // Read straight from skillforge's deploy bundles (sibling of the Noah repo).
+    path: env(
+      "KERNEL_PATH",
+      resolve(import.meta.dir, "../../skillforge/deploy/bundles/reasoning-kernel.md"),
+    ),
+    litePath: env(
+      "KERNEL_LITE_PATH",
+      resolve(import.meta.dir, "../../skillforge/deploy/bundles/reasoning-kernel-lite.md"),
+    ),
+  },
+
+  // Obsidian vault read access (P2). READ-ONLY: Noah reads Root's curated notes on
+  // demand; it never writes to the vault and never auto-imports vault content into
+  // memory. Sensitive subtrees are excluded by default (IP boundary).
+  vault: {
+    enabled: envBool("NOAH_VAULT_ENABLED", true),
+    path: env("NOAH_VAULT_PATH", "C:\\Users\\MyOme\\OneDrive\\Documents\\RootCellar2"),
+    // Directory names (any depth) excluded from all vault access. `.obsidian` is the
+    // app's own config; `06-sensitive` is IP-sensitive. Anything matching "shannon"
+    // is hard-blocked in code regardless of this list.
+    exclude: env("NOAH_VAULT_EXCLUDE", ".obsidian,06-sensitive,_raw")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+    // Vault content trust: Root's curated notes (above conversation 0.85, below seed 1.0).
+    trust: 0.9,
+    maxFileBytes: envInt("NOAH_VAULT_MAX_FILE_BYTES", 200_000),
+    maxResults: envInt("NOAH_VAULT_MAX_RESULTS", 8),
+    snippetChars: envInt("NOAH_VAULT_SNIPPET_CHARS", 240),
+  },
+
   webSearch: {
     provider: env("NOAH_WEB_SEARCH_PROVIDER", "stub") as "stub" | "ddg",
   },
@@ -79,4 +129,10 @@ export function validateConfig(): void {
   }
   console.log(`[noah] Memory user: ${config.memory.userId}`);
   console.log(`[noah] Web search: ${config.webSearch.provider}`);
+  console.log(
+    `[noah] Kernel: ${config.kernel.enabled ? config.kernel.tier : "disabled"}`,
+  );
+  console.log(
+    `[noah] Vault: ${config.vault.enabled ? config.vault.path : "disabled"}`,
+  );
 }

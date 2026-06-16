@@ -1,6 +1,8 @@
 import { config } from "./config";
 import { wrapAsData } from "./data-boundary";
 import { createKernel } from "./kernel-seam";
+import { loadKernel } from "./kernel";
+import { detectSkills } from "./skill-detect";
 import { log } from "./logger";
 import { memoryClient } from "./memory-client";
 import { createModelClient, type Message, type ToolCall } from "./model-client";
@@ -73,6 +75,11 @@ You can also call it mid-conversation for specific lookups.
 - memory_inspect: Get full details of a specific memory by ID.
 - web_research: Search the web for factual questions you can't answer from \
 memory or training data. Results are untrusted (60% confidence) — verify before relying.
+- vault_search / vault_read: Read Root's Obsidian vault — his curated notes on \
+projects, intel, and personal context (90% trust). When Root asks about the vault \
+itself (file counts, what's in it) or about something likely captured in his notes, \
+CHECK the vault before answering — don't guess. Omit the query to vault_search to \
+count/list files. The vault is READ-ONLY; you cannot modify it.
 - Store as third-person factual statement. "I like X" → store "Root likes X." \
 Never reverse subject/object.
 
@@ -146,7 +153,7 @@ function extractJsonObject(text: string, start: number): string | null {
 }
 
 const TOOL_NAME_SOURCE =
-  '"name"\\s*:\\s*"(memory_remember|memory_recall|memory_forget|memory_inspect|web_research)"';
+  '"name"\\s*:\\s*"(memory_remember|memory_recall|memory_forget|memory_inspect|web_research|vault_search|vault_read)"';
 
 function parseToolCalls(message: {
   content?: string;
@@ -312,7 +319,17 @@ export async function* chat(
   const userContext = `\n${memoryContext}\n\n[SESSION CORRECTIONS]\n${correctionsBlock}`;
   const augmentedUserMessage = kernelResult.processedMessage + userContext;
 
-  const systemWithTime = SYSTEM_PROMPT + `\nCurrent time: ${timeStr}`;
+  // Injection order (OK-team spec): [system prompt] → [kernel] → [memory] → [user].
+  // The kernel rides on the system message (so it precedes the user turn, which
+  // carries the memory context); `Current time` stays last as part of CURRENT STATE.
+  // A non-active kernel (disabled / tier=none / missing file) injects nothing — the
+  // system prompt is byte-identical to pre-P2.
+  const kernelLoad = loadKernel();
+  const kernelBlock = kernelLoad.active
+    ? `\n\n=== BEHAVIORAL KERNEL (how to think — applies to every response) ===\n${kernelLoad.text}\n=== END BEHAVIORAL KERNEL ===\n`
+    : "";
+  const systemWithTime =
+    SYSTEM_PROMPT + kernelBlock + `\nCurrent time: ${timeStr}`;
   const messages: Message[] = [
     { role: "system", content: systemWithTime },
     ...history.map(
@@ -329,6 +346,12 @@ export async function* chat(
       memory_available: memoryClient.isAvailable,
       degraded,
       signals: recallResult.signals,
+      kernel: {
+        active: kernelLoad.active,
+        tier: kernelLoad.tier,
+        version: kernelLoad.version,
+        tokens: kernelLoad.tokenEstimate,
+      },
     }),
   };
 
@@ -515,6 +538,19 @@ export async function* chat(
   }
   yield { type: "token", data: responseText };
 
+  // Observational skill-activation detection (heuristic; feeds Sleipnir later).
+  const skillsActive = kernelLoad.active
+    ? detectSkills(responseText, userMessage)
+    : [];
+  if (kernelLoad.active) {
+    log("info", "kernel.skills", {
+      cid: conversationId,
+      skills: skillsActive,
+      kernelVersion: kernelLoad.version,
+      kernelTier: kernelLoad.tier,
+    });
+  }
+
   const totalMs = Date.now() - startTime;
   log("info", "chat.done", { cid: conversationId, ms: totalMs, toolCalls: toolCallsMade.length, degraded, provider: config.provider });
   yield {
@@ -530,7 +566,8 @@ export async function* chat(
             : config.cloud.model,
         memory_ids: recallResult.memories.map((m) => m.id),
         tools_fired: [...new Set(toolCallsMade.map((tc) => tc.name))],
-        skills_active: [],
+        skills_active: skillsActive,
+        kernel_version: kernelLoad.active ? kernelLoad.version : "none",
         degraded,
       },
     }),

@@ -1,7 +1,14 @@
 import type { ToolDef, ToolCall } from "./model-client";
-import { wrapWebResearchAsData } from "./data-boundary";
+import { wrapWebResearchAsData, wrapVaultAsData } from "./data-boundary";
 import { memoryClient } from "./memory-client";
 import { webResearch } from "./web-research";
+import { config } from "./config";
+import {
+  searchVault,
+  readVaultFile,
+  vaultStats,
+  vaultAvailable,
+} from "./vault";
 
 const MEMORY_TOOLS: ToolDef[] = [
   {
@@ -179,8 +186,58 @@ const WEB_RESEARCH_TOOL: ToolDef = {
   },
 };
 
+const VAULT_TOOLS: ToolDef[] = [
+  {
+    type: "function",
+    function: {
+      name: "vault_search",
+      description:
+        "Search Root's Obsidian vault (his curated markdown notes) by keyword. " +
+        "READ-ONLY. Returns matching files with snippets. Omit the query to get the " +
+        "total file count and a listing instead — use that to answer 'how many files' " +
+        "or 'what's in my vault'. Vault content carries 90% trust (Root's own notes).",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description:
+              "Keywords to search for. Omit or leave empty to list/count all files.",
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "vault_read",
+      description:
+        "Read the full content of one file from Root's Obsidian vault, by its " +
+        "vault-relative path (as returned by vault_search). READ-ONLY.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Vault-relative file path, e.g. '05-projects/noah.md'",
+          },
+        },
+        required: ["path"],
+      },
+    },
+  },
+];
+
 export function getAllTools(): ToolDef[] {
-  return [...MEMORY_TOOLS, WEB_RESEARCH_TOOL];
+  const tools = [...MEMORY_TOOLS, WEB_RESEARCH_TOOL];
+  // Only advertise vault tools when the vault is actually reachable, so the model
+  // isn't offered a capability that will always error.
+  if (config.vault.enabled && vaultAvailable()) {
+    tools.push(...VAULT_TOOLS);
+  }
+  return tools;
 }
 
 export async function dispatchTool(
@@ -237,6 +294,48 @@ export async function dispatchTool(
     case "web_research": {
       const result = await webResearch(args.query);
       return wrapWebResearchAsData(result.query, result.results);
+    }
+
+    case "vault_search": {
+      const query = typeof args.query === "string" ? args.query.trim() : "";
+      // No query → listing/count mode (answers "how many files in my vault").
+      if (!query) {
+        const stats = vaultStats();
+        return JSON.stringify({
+          source: "obsidian_vault",
+          trust: config.vault.trust,
+          total_files: stats.fileCount,
+          total_bytes: stats.totalBytes,
+          note: "Vault listing — to read a file, call vault_read with its path.",
+        });
+      }
+      const hits = searchVault(query);
+      if (!hits.length) {
+        return JSON.stringify({
+          source: "obsidian_vault",
+          query,
+          results: [],
+          note: "No matching vault content found.",
+        });
+      }
+      return wrapVaultAsData(
+        hits.map((h) => ({ path: h.path, text: h.snippet })),
+      );
+    }
+
+    case "vault_read": {
+      const path = typeof args.path === "string" ? args.path : "";
+      const result = readVaultFile(path);
+      if (!result.ok) {
+        return JSON.stringify({ source: "obsidian_vault", error: result.error });
+      }
+      return wrapVaultAsData([
+        {
+          path: result.path!,
+          text: result.content!,
+          truncated: result.truncated,
+        },
+      ]);
     }
 
     default:

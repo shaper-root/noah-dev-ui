@@ -49,6 +49,19 @@ mock.module("./tool-router", () => ({
   getAllTools: mockGetAllTools,
   dispatchTool: mockDispatchTool,
 }));
+mock.module("./kernel", () => ({
+  loadKernel: () => ({
+    active: false,
+    tier: "none",
+    text: "",
+    version: "none",
+    tokenEstimate: 0,
+    source: "passthrough",
+  }),
+}));
+mock.module("./skill-detect", () => ({
+  detectSkills: () => [],
+}));
 
 const { chat } = await import("./noah");
 
