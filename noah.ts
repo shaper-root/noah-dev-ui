@@ -2,6 +2,7 @@ import { config } from "./config";
 import { wrapAsData } from "./data-boundary";
 import { createKernel } from "./kernel-seam";
 import { loadKernel } from "./kernel";
+import { loadSelfKnowledge } from "./self-knowledge";
 import { detectSkills } from "./skill-detect";
 import { log } from "./logger";
 import { memoryClient } from "./memory-client";
@@ -64,6 +65,18 @@ as type: preference. Apply from that moment forward.
 memory_remember as type: goal. If a deadline is relevant, note it in content.
 7. When corrected, acknowledge, store the correction as type: feedback, \
 apply immediately. Don't over-explain why you were wrong.
+8. CHECK BEFORE ACCEPTING. When Root states a factual claim (where he lives, \
+what he did, names, dates, schools, jobs), first compare against the recalled \
+memory block. If a stored memory CONTRADICTS the claim, flag it explicitly: \
+"I have stored that <X>. Should I update that to <Y>?" — then wait for \
+confirmation. If confirmed, call memory_remember with supersedes:<old_id> \
+so the supersession lineage is recorded. The trust score in the [source, trust X.XX] \
+tag matters: a seed/manual memory (trust 1.0) outweighs a fresh assertion until \
+Root explicitly confirms the change. Never silently accept a claim that \
+contradicts a stored memory.
+9. After every memory_remember call, READ THE RESULT. If stored:false, you \
+MUST tell Root the write failed — do not claim it was stored. The result \
+includes an _agent_advisory string when this happens; follow it exactly.
 
 TOOL USAGE
 - memory_remember: When Root shares info worth remembering, expresses a \
@@ -414,17 +427,26 @@ export async function* chat(
   const userContext = `\n${memoryContext}\n\n[SESSION CORRECTIONS]\n${correctionsBlock}`;
   const augmentedUserMessage = kernelResult.processedMessage + userContext;
 
-  // Injection order (OK-team spec): [system prompt] → [kernel] → [memory] → [user].
-  // The kernel rides on the system message (so it precedes the user turn, which
-  // carries the memory context); `Current time` stays last as part of CURRENT STATE.
-  // A non-active kernel (disabled / tier=none / missing file) injects nothing — the
-  // system prompt is byte-identical to pre-P2.
+  // Injection order: [system prompt] → [kernel] → [self-knowledge] → [memory] → [user].
+  // Kernel + self-knowledge ride on the system message (so they precede the user
+  // turn, which carries the memory context); `Current time` stays last as part of
+  // CURRENT STATE. A non-active kernel or missing self-knowledge file injects
+  // nothing — pre-Phase-5 behavior preserved when the vault note is absent.
   const kernelLoad = loadKernel();
   const kernelBlock = kernelLoad.active
     ? `\n\n=== BEHAVIORAL KERNEL (how to think — applies to every response) ===\n${kernelLoad.text}\n=== END BEHAVIORAL KERNEL ===\n`
     : "";
+  // Phase 5: self-knowledge tracker. The vault note is a behavioral mirror —
+  // known weaknesses and the compensations I apply for each. It rides AFTER the
+  // kernel because the kernel sets HOW I think and self-knowledge tells me
+  // WHERE my thinking tends to fail. Treated as instruction (high trust: it's
+  // my own authored mirror), not data — no spotlighting delimiters.
+  const selfKnowledge = loadSelfKnowledge();
+  const selfKnowledgeBlock = selfKnowledge.active
+    ? `\n\n=== SELF-KNOWLEDGE (known weaknesses + active compensations) ===\n${selfKnowledge.text}\n=== END SELF-KNOWLEDGE ===\n`
+    : "";
   const systemWithTime =
-    SYSTEM_PROMPT + kernelBlock + `\nCurrent time: ${timeStr}`;
+    SYSTEM_PROMPT + kernelBlock + selfKnowledgeBlock + `\nCurrent time: ${timeStr}`;
   const messages: Message[] = [
     { role: "system", content: systemWithTime },
     ...history.map(
@@ -450,6 +472,11 @@ export async function* chat(
         tier: kernelLoad.tier,
         version: kernelLoad.version,
         tokens: kernelLoad.tokenEstimate,
+      },
+      self_knowledge: {
+        active: selfKnowledge.active,
+        tokens: selfKnowledge.tokenEstimate,
+        source: selfKnowledge.source,
       },
     }),
   };

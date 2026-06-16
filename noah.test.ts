@@ -13,6 +13,9 @@ const testConfig = {
   mcpToolTimeoutMs: 15_000,
   maxContextChars: 40_000,
   shortUtteranceThreshold: 5,
+  // Required by the real loadSelfKnowledge module (which we no longer mock).
+  // Disabled here so the loader returns passthrough cleanly without touching disk.
+  vault: { enabled: false, path: "" },
 };
 
 mock.module("./config", () => ({ config: testConfig }));
@@ -66,6 +69,10 @@ mock.module("./kernel", () => ({
     source: "passthrough",
   }),
 }));
+// Self-knowledge is NOT mocked: testConfig.vault.enabled=false makes the real
+// loader return passthrough deterministically, and not mocking here lets
+// self-knowledge.test.ts exercise the real module without bun's process-global
+// mock.module shadowing it.
 mock.module("./skill-detect", () => ({
   detectSkills: () => [],
 }));
