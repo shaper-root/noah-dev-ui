@@ -30,12 +30,19 @@ function parseDdgResults(html: string): WebResearchEntry[] {
   return results;
 }
 
+const DDG_TIMEOUT_MS = 8_000;
+
 async function ddgSearch(query: string): Promise<WebResearchResult> {
   const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
 
+  // Bound the fetch: a hung search must not stall the whole tool round (the
+  // dispatch path has no other deadline). Abort + degrade to empty results.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DDG_TIMEOUT_MS);
   try {
     const resp = await fetch(url, {
       headers: { "User-Agent": "Noah/1.0 (local assistant)" },
+      signal: controller.signal,
     });
 
     if (!resp.ok) {
@@ -52,6 +59,8 @@ async function ddgSearch(query: string): Promise<WebResearchResult> {
   } catch (err) {
     console.warn("[web-research] DDG fetch failed:", err);
     return { query, results: [], source: "web_research" };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

@@ -7,6 +7,8 @@ import { createModelClient, type Message, type ToolCall } from "./model-client";
 import { getAllTools, dispatchTool } from "./tool-router";
 
 const MAX_CORRECTIONS = 50;
+const MAX_SESSION_CONVERSATIONS = 500; // bound the in-process corrections map
+const KERNEL_TIMEOUT_MS = 5_000; // deadline for kernel.process (passthrough today)
 
 const sessionCorrections = new Map<string, string[]>();
 
@@ -265,13 +267,21 @@ export async function* chat(
 
   let kernelResult = { processedMessage: userMessage, processedMemories: [] as unknown[] };
   try {
-    kernelResult = await kernel.process({
-      userMessage,
-      memories: (recallResult as { memories: unknown[] }).memories,
-      conversationHistory: history,
-    }) as typeof kernelResult;
+    // Bound kernel.process now (while it's passthrough) so a future non-passthrough
+    // kernel can never hang a turn — degrade to the raw message on timeout.
+    kernelResult = await Promise.race([
+      kernel.process({
+        userMessage,
+        memories: (recallResult as { memories: unknown[] }).memories,
+        conversationHistory: history,
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("kernel timed out")), KERNEL_TIMEOUT_MS),
+      ),
+    ]) as typeof kernelResult;
   } catch (err) {
     console.warn("[noah] Kernel processing failed, using raw message:", err);
+    log("warn", "kernel.fail", { cid: conversationId, err: err instanceof Error ? err.message : String(err) });
     degraded = true;
   }
 
@@ -436,6 +446,14 @@ export async function* chat(
               corrections.splice(0, corrections.length - MAX_CORRECTIONS);
             }
             sessionCorrections.set(conversationId, corrections);
+            // Bound total tracked conversations (FIFO) so the map can't grow
+            // unbounded across the server's lifetime.
+            if (sessionCorrections.size > MAX_SESSION_CONVERSATIONS) {
+              const oldest = sessionCorrections.keys().next().value;
+              if (oldest !== undefined && oldest !== conversationId) {
+                sessionCorrections.delete(oldest);
+              }
+            }
           }
         }
         continue;
