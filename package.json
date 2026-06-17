@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "bun run --watch server.ts",
     "start": "bun run server.ts",
+    "test": "bun test",
     "recall-eval": "bun run eval/recall-at-k.ts"
   },
   "dependencies": {

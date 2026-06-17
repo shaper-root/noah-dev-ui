@@ -1,8 +1,17 @@
 import { config } from "./config";
-import { wrapAsData } from "./data-boundary";
+import { wrapAsData, wrapSessionSummariesAsData } from "./data-boundary";
+import {
+  detectConflictTags,
+  extractClaims,
+  vaultQueryForClaims,
+  type VaultFactInput,
+} from "./conflict-detector";
+import { searchVault, vaultProvenance, vaultAvailable } from "./vault";
+import type { RecalledMemory } from "./memory-client";
 import { createKernel } from "./kernel-seam";
 import { loadKernel } from "./kernel";
 import { loadSelfKnowledge } from "./self-knowledge";
+import { getVaultIndexInjection } from "./vault-index";
 import { detectSkills } from "./skill-detect";
 import { log } from "./logger";
 import { memoryClient } from "./memory-client";
@@ -457,14 +466,11 @@ export async function* chat(
     try {
       const recent = readRecentSessionSummaries(3);
       if (recent.length > 0) {
-        sessionSummariesBlock =
-          "\n\n[RECENT SESSION SUMMARIES — cross-device continuity, from the vault]\n" +
-          recent
-            .map(
-              (s, i) =>
-                `--- summary ${i + 1}: ${s.path} ---\n${s.text}\n--- end summary ${i + 1} ---`,
-            )
-            .join("\n\n");
+        // Route session summaries through the same structured provenance +
+        // spotlighting treatment as vault_search/vault_read. They arrive already
+        // classified (they live in _noah/ → imported, 0.5), so they are never
+        // surfaced unlabeled or as authoritative.
+        sessionSummariesBlock = "\n\n" + wrapSessionSummariesAsData(recent);
       }
     } catch (err) {
       log("warn", "vault-bridge.summaries.read_fail", {
@@ -485,7 +491,53 @@ export async function* chat(
         `continuity.\n`
       : "";
 
-  const userContext = `\n${memoryContext}${sessionSummariesBlock}${sessionPrep}\n\n[SESSION CORRECTIONS]\n${correctionsBlock}`;
+  // Stage 2: structural conflict detection (Approach C). Runs only when the
+  // user makes a checkable entity+value assertion. Checks the claim against
+  // BOTH the already-recalled memories AND a proactive vault search (each hit
+  // provenance-classified by Stage 1). Emits provenance-aware [MEMORY_CONFLICT]
+  // tags here — after retrieval, before generation. DETECT + INJECT only: it
+  // never resolves the conflict, never picks a winner, never mutates memory or
+  // vault (resolution = the disconfirmation-discipline skill + the human). A
+  // detector error must never break a turn, so it is fully swallowed.
+  let conflictBlock = "";
+  try {
+    const claims = extractClaims(userMessage);
+    if (claims.length > 0) {
+      let vaultFacts: VaultFactInput[] = [];
+      if (vaultAvailable()) {
+        const hits = searchVault(vaultQueryForClaims(claims));
+        vaultFacts = hits.map((h) => {
+          const prov = vaultProvenance(h.path);
+          return {
+            path: h.path,
+            text: h.snippet,
+            provenance: prov.provenance,
+            trust: prov.trust,
+          };
+        });
+      }
+      const memoriesForConflict = (recallResult.memories ?? []) as unknown as RecalledMemory[];
+      const tags = detectConflictTags(userMessage, memoriesForConflict, vaultFacts);
+      if (tags.length > 0) {
+        conflictBlock =
+          "\n\n[MEMORY CONFLICTS — surface these to Root and ask which is right; " +
+          "do NOT auto-resolve or overwrite stored facts]\n" +
+          tags.join("\n");
+        log("info", "conflict.detected", {
+          cid: conversationId,
+          count: tags.length,
+          vault_checked: vaultFacts.length,
+        });
+      }
+    }
+  } catch (err) {
+    log("warn", "conflict.detect.fail", {
+      cid: conversationId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  const userContext = `\n${memoryContext}${sessionSummariesBlock}${conflictBlock}${sessionPrep}\n\n[SESSION CORRECTIONS]\n${correctionsBlock}`;
   const augmentedUserMessage = kernelResult.processedMessage + userContext;
 
   // Injection order: [system prompt] → [kernel] → [self-knowledge] → [memory] → [user].
@@ -506,8 +558,18 @@ export async function* chat(
   const selfKnowledgeBlock = selfKnowledge.active
     ? `\n\n=== SELF-KNOWLEDGE (known weaknesses + active compensations) ===\n${selfKnowledge.text}\n=== END SELF-KNOWLEDGE ===\n`
     : "";
+  // Vault index (Level 1 awareness): a compact digest of what's in Root's vault
+  // — directory counts + the 20 most-recent notes with topic hints — so Noah
+  // knows its notes exist without searching blind. First message only: it's
+  // orientation, not per-turn reference; the full cached index still powers
+  // vault_search on every turn. Treated as DATA (fenced), not instruction.
+  const vaultIndexBlock = isFirstMessageOfSession ? getVaultIndexInjection() : "";
   const systemWithTime =
-    SYSTEM_PROMPT + kernelBlock + selfKnowledgeBlock + `\nCurrent time: ${timeStr}`;
+    SYSTEM_PROMPT +
+    kernelBlock +
+    selfKnowledgeBlock +
+    vaultIndexBlock +
+    `\nCurrent time: ${timeStr}`;
   const messages: Message[] = [
     { role: "system", content: systemWithTime },
     ...history.map(
