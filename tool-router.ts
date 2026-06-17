@@ -345,6 +345,12 @@ export async function dispatchTool(
     args = (rawArgs as Record<string, any>) ?? {};
   }
 
+  // Defense-in-depth: dispatchTool must NEVER throw out of here. Any tool
+  // failure — network/fetch error, MCP reject, a future tool impl, an
+  // unexpected throw — is converted to a structured error STRING so the turn
+  // degrades gracefully and the SSE stream never dies. (The arg-parse above is
+  // already guarded; this wraps every tool implementation in the switch.)
+  try {
   switch (name) {
     case "memory_remember": {
       // Auto-fill provenance: every stored memory carries the model that wrote
@@ -471,5 +477,10 @@ export async function dispatchTool(
 
     default:
       return JSON.stringify({ error: `Unknown tool: ${name}` });
+  }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log("warn", "tool.dispatch.threw", { name, err: msg });
+    return JSON.stringify({ error: `Tool ${name} failed: ${msg}` });
   }
 }
