@@ -16,6 +16,10 @@ const testConfig = {
   // Required by the real loadSelfKnowledge module (which we no longer mock).
   // Disabled here so the loader returns passthrough cleanly without touching disk.
   vault: { enabled: false, path: "" },
+  // Required by vault-bridge — disabled here so the real module returns
+  // early and doesn't touch the filesystem or memory.db during tests.
+  vaultBridge: { enabled: false, deviceId: "test" },
+  memory: { userId: "test", sqlitePath: "", memoryApiDir: "" },
 };
 
 mock.module("./config", () => ({ config: testConfig }));

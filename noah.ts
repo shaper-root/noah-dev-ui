@@ -8,6 +8,11 @@ import { log } from "./logger";
 import { memoryClient } from "./memory-client";
 import { createModelClient, type Message, type ToolCall } from "./model-client";
 import { getAllTools, getMemoryTools, dispatchTool } from "./tool-router";
+import {
+  exportMemoryIncremental,
+  readRecentSessionSummaries,
+  type ExportedMemoryRow,
+} from "./vault-bridge";
 
 const MAX_CORRECTIONS = 50;
 const MAX_SESSION_CONVERSATIONS = 500; // bound the in-process corrections map
@@ -441,22 +446,45 @@ export async function* chat(
 
   const memoryContext = wrapAsData(kernelResult.processedMemories);
 
-  // Phase 6A: on the first message of a new conversation, prompt Noah to lead
-  // with a 2-3 sentence "where we left off" using the recalled memory block
-  // BEFORE answering the user's message. Only fires when memory actually
-  // returned something to brief on — otherwise it would force a confabulation.
+  // Phase 6A + Phase 5C (vault-bridge): on the first message of a new
+  // conversation, prompt Noah to lead with a 2-3 sentence "where we left off"
+  // using BOTH the recalled memory block AND the most recent session
+  // summaries from the vault (cross-device). Only fires when there's
+  // something to brief on — otherwise it would force a confabulation.
+  let sessionSummariesBlock = "";
+  if (isFirstMessageOfSession) {
+    try {
+      const recent = readRecentSessionSummaries(3);
+      if (recent.length > 0) {
+        sessionSummariesBlock =
+          "\n\n[RECENT SESSION SUMMARIES — cross-device continuity, from the vault]\n" +
+          recent
+            .map(
+              (s, i) =>
+                `--- summary ${i + 1}: ${s.path} ---\n${s.text}\n--- end summary ${i + 1} ---`,
+            )
+            .join("\n\n");
+      }
+    } catch (err) {
+      log("warn", "vault-bridge.summaries.read_fail", {
+        cid: conversationId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
   const sessionPrep =
-    isFirstMessageOfSession && recallResult.count > 0
+    isFirstMessageOfSession && (recallResult.count > 0 || sessionSummariesBlock)
       ? `\n\n[SESSION START — first message of this conversation]\n` +
         `Lead with a brief (2-3 sentence) "where we left off" using the recalled\n` +
-        `memory block above. Make continuity tangible from the first reply: name\n` +
-        `the most recent thread or two, then answer the user's message. Do NOT\n` +
-        `produce a wall of text; this is an orientation, not a recap. If memory\n` +
-        `is sparse or weakly relevant, skip the opener and just answer — honest\n` +
-        `brevity beats forced continuity.\n`
+        `memory block above AND the recent session summaries (cross-device). Make\n` +
+        `continuity tangible from the first reply: name the most recent thread or\n` +
+        `two, then answer the user's message. Do NOT produce a wall of text;\n` +
+        `this is an orientation, not a recap. If everything is sparse or weakly\n` +
+        `relevant, skip the opener and just answer — honest brevity beats forced\n` +
+        `continuity.\n`
       : "";
 
-  const userContext = `\n${memoryContext}${sessionPrep}\n\n[SESSION CORRECTIONS]\n${correctionsBlock}`;
+  const userContext = `\n${memoryContext}${sessionSummariesBlock}${sessionPrep}\n\n[SESSION CORRECTIONS]\n${correctionsBlock}`;
   const augmentedUserMessage = kernelResult.processedMessage + userContext;
 
   // Injection order: [system prompt] → [kernel] → [self-knowledge] → [memory] → [user].
@@ -663,14 +691,51 @@ export async function* chat(
           if (n.name === "memory_remember") {
             try {
               const parsed = JSON.parse(result) as Record<string, unknown>;
+              const stored = parsed.stored === true;
               memoryStoreResults.push({
                 content: typeof n.args.content === "string" ? n.args.content : "",
-                stored: parsed.stored === true,
+                stored,
                 id: parsed.id as string | undefined,
                 reason: parsed.reason as string | undefined,
                 kind: parsed.kind as string | undefined,
                 explicit: parsed.explicit as boolean | undefined,
               });
+              // Phase 5A vault bridge: every successful memory write is
+              // exported INCREMENTALLY to the day's vault file so a sleep /
+              // kill / crash doesn't lose what's already in memory.db before
+              // the next reconciliation. Best-effort: vault unavailable is
+              // logged but never blocks the turn.
+              if (stored && parsed.id) {
+                const content =
+                  typeof n.args.content === "string" ? n.args.content : "";
+                const modelId =
+                  config.provider === "local"
+                    ? config.ollama.model
+                    : config.cloud.model;
+                const row: ExportedMemoryRow = {
+                  id: String(parsed.id),
+                  content,
+                  type:
+                    typeof n.args.type === "string"
+                      ? (n.args.type as string)
+                      : "fact",
+                  source: "conversation",
+                  source_ref: `model:${config.provider}:${modelId}`,
+                  confidence:
+                    typeof parsed.confidence === "number"
+                      ? (parsed.confidence as number)
+                      : 0.85,
+                  created_at: new Date().toISOString(),
+                };
+                try {
+                  exportMemoryIncremental(row);
+                } catch (vErr) {
+                  log("warn", "vault-bridge.export.threw", {
+                    cid: conversationId,
+                    err: vErr instanceof Error ? vErr.message : String(vErr),
+                  });
+                }
+              }
             } catch {
               memoryStoreResults.push({
                 content: typeof n.args.content === "string" ? n.args.content : "",

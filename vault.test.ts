@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdirSync, writeFileSync, rmSync, symlinkSync } from "fs";
+import { mkdirSync, writeFileSync, rmSync, symlinkSync, existsSync, readFileSync } from "fs";
 import { resolve } from "path";
 import { config } from "./config";
 import {
@@ -8,6 +8,8 @@ import {
   readVaultFile,
   vaultStats,
   vaultAvailable,
+  writeNote,
+  appendToNote,
 } from "./vault";
 
 const FIXTURE = resolve(import.meta.dir, ".test-vault-fixture");
@@ -161,5 +163,104 @@ describe("vault read", () => {
     expect(r.truncated).toBe(true);
     expect(r.content!.length).toBeLessThanOrEqual(10);
     config.vault.maxFileBytes = 200_000;
+  });
+});
+
+describe("vault writes (P3 vault-bridge)", () => {
+  test("writeNote creates a file under _noah/ with the supplied content", () => {
+    const r = writeNote("_noah/memories/test.md", "hello\n");
+    expect(r.ok).toBe(true);
+    expect(r.path).toBe("_noah/memories/test.md");
+    expect(r.bytes).toBe(6);
+    expect(existsSync(resolve(FIXTURE, "_noah/memories/test.md"))).toBe(true);
+    expect(readFileSync(resolve(FIXTURE, "_noah/memories/test.md"), "utf-8")).toBe(
+      "hello\n",
+    );
+  });
+
+  test("writeNote refuses to clobber by default", () => {
+    writeNote("_noah/dup.md", "first", { overwrite: false });
+    const r = writeNote("_noah/dup.md", "second", { overwrite: false });
+    expect(r.ok).toBe(false);
+    expect(r.kind).toBe("exists");
+    expect(readFileSync(resolve(FIXTURE, "_noah/dup.md"), "utf-8")).toBe("first");
+  });
+
+  test("writeNote with overwrite:true replaces existing content", () => {
+    writeNote("_noah/over.md", "v1");
+    const r = writeNote("_noah/over.md", "v2", { overwrite: true });
+    expect(r.ok).toBe(true);
+    expect(readFileSync(resolve(FIXTURE, "_noah/over.md"), "utf-8")).toBe("v2");
+  });
+
+  test("writeNote DENIES any path outside _noah/", () => {
+    const cases = [
+      "evil.md",
+      "projects/evil.md",
+      "../escape.md",
+      "_noah-fake/x.md",
+      "/abs/path.md",
+      "C:\\windows.md",
+      "_NOAH/upper.md", // case-sensitive
+    ];
+    for (const p of cases) {
+      const r = writeNote(p, "nope");
+      expect(r.ok).toBe(false);
+    }
+    // The original notes outside _noah/ must remain untouched.
+    expect(readFileSync(resolve(FIXTURE, "intel.md"), "utf-8")).toContain(
+      "Market intel",
+    );
+  });
+
+  test("writeNote DENIES traversal even when prefixed _noah/", () => {
+    const r = writeNote("_noah/../escape.md", "nope");
+    expect(r.ok).toBe(false);
+    expect(r.kind).toBe("denied_traversal");
+    expect(existsSync(resolve(FIXTURE, "escape.md"))).toBe(false);
+  });
+
+  test("writeNote DENIES Shannon paths", () => {
+    const r = writeNote("_noah/shannon-notes.md", "nope");
+    expect(r.ok).toBe(false);
+    expect(r.kind).toBe("denied_shannon");
+  });
+
+  test("writeNote DENIES non-md/json extensions", () => {
+    const r = writeNote("_noah/binary.png", "nope");
+    expect(r.ok).toBe(false);
+    expect(r.kind).toBe("denied_extension");
+  });
+
+  test("writeNote DENIES oversized content (>256KB)", () => {
+    const big = "x".repeat(257 * 1024);
+    const r = writeNote("_noah/big.md", big);
+    expect(r.ok).toBe(false);
+    expect(r.kind).toBe("denied_oversize");
+  });
+
+  test("appendToNote creates the file when missing and appends when present", () => {
+    rmSync(resolve(FIXTURE, "_noah/append.md"), { force: true });
+    let r = appendToNote("_noah/append.md", "line 1\n");
+    expect(r.ok).toBe(true);
+    r = appendToNote("_noah/append.md", "line 2\n");
+    expect(r.ok).toBe(true);
+    expect(readFileSync(resolve(FIXTURE, "_noah/append.md"), "utf-8")).toBe(
+      "line 1\nline 2\n",
+    );
+  });
+
+  test("appendToNote enforces the same _noah/ jail as writeNote", () => {
+    const r = appendToNote("../outside.md", "nope");
+    expect(r.ok).toBe(false);
+    expect(r.kind).toBe("denied_prefix");
+  });
+
+  test("createDirs:false refuses to mkdir parents (existing dir only)", () => {
+    const r = writeNote("_noah/new-tree/deeper/note.md", "x", {
+      createDirs: false,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.kind).toBe("io_error");
   });
 });

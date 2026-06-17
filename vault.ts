@@ -1,26 +1,40 @@
 /**
- * Obsidian vault read access (P2).
+ * Obsidian vault access.
  *
- * Gives Noah READ-ONLY access to Root's curated Obsidian vault (RootCellar2). The
- * agent reads notes on demand via the vault_search / vault_read tools — it never
- * writes, and vault content is never auto-imported into memory.
+ * READ surface (P2): Noah reads Root's curated notes via vault_search /
+ * vault_read tools — vault content is never auto-imported into memory.
+ *
+ * WRITE surface (P3 vault-bridge): Noah writes structured artifacts (memory
+ * exports, session summaries, observations) to the `_noah/` subdirectory ONLY.
+ * The agent cannot write anywhere else in the vault, ever. Every write is
+ * logged. Deletion is not exposed at all.
  *
  * Security posture:
- *  - READ-ONLY by construction: this module exposes no write/delete path.
  *  - Path-jailed: every resolved path must stay within the configured vault root;
  *    traversal (`../`, absolute paths) is rejected.
+ *  - WRITE jail: writes additionally must stay within `_noah/` (NOAH_WRITE_PREFIX).
  *  - Excluded subtrees: directory names in config.vault.exclude (default
  *    `.obsidian`, `06-sensitive`, `_raw`) are invisible to search and read.
  *  - Hard IP block: any path containing "shannon" (case-insensitive) is refused
- *    regardless of the exclude list (CLAUDE.md Shannon boundary).
- *  - Size-capped reads (config.vault.maxFileBytes).
+ *    regardless of the exclude list (CLAUDE.md Shannon boundary). Applies to
+ *    writes too: a Shannon-named write target is rejected.
+ *  - Size-capped reads (config.vault.maxFileBytes) and writes (NOAH_MAX_WRITE_BYTES).
  *
  * Trust: vault content is labeled at config.vault.trust (0.9) — above conversation
  * memories (0.85), below seed (1.0). See data-boundary.wrapVaultAsData.
  */
 
-import { readFileSync, readdirSync, statSync, existsSync, realpathSync } from "fs";
-import { resolve, relative, sep, extname } from "path";
+import {
+  readFileSync,
+  readdirSync,
+  statSync,
+  existsSync,
+  realpathSync,
+  writeFileSync,
+  appendFileSync,
+  mkdirSync,
+} from "fs";
+import { resolve, relative, sep, extname, dirname } from "path";
 import { config } from "./config";
 import { log } from "./logger";
 
@@ -278,6 +292,222 @@ export interface VaultReadResult {
   content?: string;
   truncated?: boolean;
   error?: string;
+}
+
+// ── WRITE surface (vault-bridge) ─────────────────────────────────────
+//
+// All writes go to `_noah/`. The directory name starts with an underscore so
+// Obsidian users see it visually segregated from their own notes. Noah cannot
+// write outside this prefix, ever — every write path is validated by
+// safeWritePath() below before any FS call.
+
+/** Vault-relative prefix every write target must start with. Hardcoded — not
+ *  env-controllable — because relaxing this is a security-property change. */
+const NOAH_WRITE_PREFIX = "_noah/";
+
+/** Hard cap per file write. 256KB is generous for a daily observation file
+ *  with structured sections; a runaway export would be caught here, not after
+ *  filling the disk. */
+const NOAH_MAX_WRITE_BYTES = 256 * 1024;
+
+/** File extensions Noah is allowed to write. Restrict to text formats so an
+ *  accidental binary write can't smuggle anything past the rest of the jail. */
+const NOAH_WRITE_EXTENSIONS = new Set([".md", ".json"]);
+
+export interface VaultWriteOptions {
+  /** Allow overwriting an existing file. Default false — refuse to clobber. */
+  overwrite?: boolean;
+  /** Create parent directories under `_noah/` if missing. Default true. */
+  createDirs?: boolean;
+}
+
+export interface VaultWriteResult {
+  ok: boolean;
+  path?: string;
+  bytes?: number;
+  error?: string;
+  /** Reason for denial when ok=false. Categorical so the caller can branch. */
+  kind?:
+    | "denied_prefix"
+    | "denied_traversal"
+    | "denied_shannon"
+    | "denied_extension"
+    | "denied_oversize"
+    | "exists"
+    | "vault_unavailable"
+    | "io_error";
+}
+
+/**
+ * Validate + resolve a write target. Returns null on rejection (the caller
+ * logs `vault.write.denied`). On success: an absolute path under the vault
+ * root + `_noah/` that's safe to write to.
+ *
+ * The validation is lexical only (no realpath) because the target file may not
+ * yet exist — instead we (a) reject any segment containing `..`, (b) reject
+ * absolute paths, (c) re-check the prefix on the resolved absolute, (d) cap
+ * size, (e) cap extensions. The Shannon block applies regardless.
+ */
+function safeWritePath(
+  relPath: string,
+): { abs: string; rel: string; kind: VaultWriteResult["kind"] } | null {
+  if (!relPath || typeof relPath !== "string") {
+    return { abs: "", rel: "", kind: "denied_prefix" } as const;
+  }
+  // Normalize to forward slashes for the prefix check; reject backslashes
+  // outright (caller is using a non-POSIX path).
+  const norm = relPath.replace(/\\/g, "/");
+  // Reject absolute and drive-letter paths.
+  if (/^(?:[a-zA-Z]:)?\//.test(norm)) {
+    return { abs: "", rel: "", kind: "denied_prefix" } as const;
+  }
+  // The prefix is the entire security boundary — must start with `_noah/`.
+  if (!norm.startsWith(NOAH_WRITE_PREFIX)) {
+    return { abs: "", rel: "", kind: "denied_prefix" } as const;
+  }
+  // Reject any `..` segment defensively (lexical check before resolve).
+  const segments = norm.split("/");
+  for (const s of segments) {
+    if (s === ".." || s === "") {
+      return { abs: "", rel: "", kind: "denied_traversal" } as const;
+    }
+  }
+  // Reject Shannon-named paths (IP boundary).
+  if (isShannon(norm)) {
+    return { abs: "", rel: "", kind: "denied_shannon" } as const;
+  }
+  // Resolve and re-check the absolute still lives under vaultRoot()/_noah/.
+  const root = vaultRoot();
+  const abs = resolve(root, norm);
+  const expectedRoot = resolve(root, "_noah") + sep;
+  if (!(abs + sep).startsWith(expectedRoot)) {
+    return { abs: "", rel: "", kind: "denied_traversal" } as const;
+  }
+  // Extension cap.
+  const ext = extname(norm).toLowerCase();
+  if (!NOAH_WRITE_EXTENSIONS.has(ext)) {
+    return { abs: "", rel: "", kind: "denied_extension" } as const;
+  }
+  return { abs, rel: norm, kind: undefined };
+}
+
+/**
+ * Write a file under `_noah/`. Returns a structured result — never throws.
+ * Refuses to clobber unless overwrite=true. Creates parent dirs by default.
+ */
+export function writeNote(
+  relPath: string,
+  content: string,
+  options: VaultWriteOptions = {},
+): VaultWriteResult {
+  if (!vaultAvailable()) {
+    return { ok: false, kind: "vault_unavailable", error: "Vault is not available." };
+  }
+  const safe = safeWritePath(relPath);
+  if (!safe || safe.kind) {
+    const kind = safe?.kind ?? "denied_prefix";
+    log("warn", "vault.write.denied", {
+      path: String(relPath).slice(0, 200),
+      kind,
+    });
+    return { ok: false, kind, error: `Write denied: ${kind}` };
+  }
+  const bytes = Buffer.byteLength(content, "utf-8");
+  if (bytes > NOAH_MAX_WRITE_BYTES) {
+    log("warn", "vault.write.denied", {
+      path: safe.rel,
+      kind: "denied_oversize",
+      bytes,
+      cap: NOAH_MAX_WRITE_BYTES,
+    });
+    return {
+      ok: false,
+      kind: "denied_oversize",
+      error: `Write exceeds ${NOAH_MAX_WRITE_BYTES} bytes (got ${bytes}).`,
+    };
+  }
+  const overwrite = options.overwrite === true;
+  const createDirs = options.createDirs !== false;
+  if (existsSync(safe.abs) && !overwrite) {
+    log("warn", "vault.write.exists", { path: safe.rel });
+    return {
+      ok: false,
+      kind: "exists",
+      error: "File already exists and overwrite=false.",
+    };
+  }
+  try {
+    if (createDirs) {
+      mkdirSync(dirname(safe.abs), { recursive: true });
+    }
+    writeFileSync(safe.abs, content, "utf-8");
+    log("info", "vault.write.ok", { path: safe.rel, bytes });
+    return { ok: true, path: safe.rel, bytes };
+  } catch (err) {
+    log("error", "vault.write.fail", {
+      path: safe.rel,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return {
+      ok: false,
+      kind: "io_error",
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
+ * Append to a file under `_noah/`. Same jail + safety as writeNote, but adds
+ * to the end. Creates the file (and parent dirs) if missing.
+ */
+export function appendToNote(relPath: string, content: string): VaultWriteResult {
+  if (!vaultAvailable()) {
+    return { ok: false, kind: "vault_unavailable", error: "Vault is not available." };
+  }
+  const safe = safeWritePath(relPath);
+  if (!safe || safe.kind) {
+    const kind = safe?.kind ?? "denied_prefix";
+    log("warn", "vault.write.denied", {
+      path: String(relPath).slice(0, 200),
+      kind,
+      op: "append",
+    });
+    return { ok: false, kind, error: `Append denied: ${kind}` };
+  }
+  const bytes = Buffer.byteLength(content, "utf-8");
+  // For append, the cap applies to the appended chunk; total file size is
+  // bounded by application logic + filesystem.
+  if (bytes > NOAH_MAX_WRITE_BYTES) {
+    log("warn", "vault.write.denied", {
+      path: safe.rel,
+      kind: "denied_oversize",
+      bytes,
+      cap: NOAH_MAX_WRITE_BYTES,
+      op: "append",
+    });
+    return {
+      ok: false,
+      kind: "denied_oversize",
+      error: `Append exceeds ${NOAH_MAX_WRITE_BYTES} bytes (got ${bytes}).`,
+    };
+  }
+  try {
+    mkdirSync(dirname(safe.abs), { recursive: true });
+    appendFileSync(safe.abs, content, "utf-8");
+    log("info", "vault.write.ok", { path: safe.rel, bytes, op: "append" });
+    return { ok: true, path: safe.rel, bytes };
+  } catch (err) {
+    log("error", "vault.write.fail", {
+      path: safe.rel,
+      err: err instanceof Error ? err.message : String(err),
+      op: "append",
+    });
+    return {
+      ok: false,
+      kind: "io_error",
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 /** Read one vault file. Path-jailed, excluded-aware, size-capped. Never throws. */

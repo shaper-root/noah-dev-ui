@@ -98,6 +98,22 @@ export const config = {
     provider: env("NOAH_WEB_SEARCH_PROVIDER", "stub") as "stub" | "ddg",
   },
 
+  // Vault bridge (P3): cross-device sync via vault-as-bridge. Each device tags
+  // its exports/summaries/observations with a stable device ID. NOAH_DEVICE_ID
+  // overrides; otherwise inferred from platform (mac on Darwin, omen on Windows,
+  // hostname-derived on Linux).
+  vaultBridge: {
+    enabled: envBool("NOAH_VAULT_BRIDGE_ENABLED", true),
+    deviceId: (() => {
+      const override = env("NOAH_DEVICE_ID", "").trim();
+      if (override) return override.toLowerCase();
+      if (process.platform === "darwin") return "mac";
+      if (process.platform === "win32") return "omen";
+      const host = (process.env.HOSTNAME || "").toLowerCase();
+      return host || "linux";
+    })(),
+  },
+
   maxToolRounds: envInt("NOAH_MAX_TOOL_ROUNDS", 3),
   mcpToolTimeoutMs: envInt("NOAH_MCP_TOOL_TIMEOUT_MS", 15_000),
   maxContextChars: envInt("NOAH_MAX_CONTEXT_CHARS", 40_000),
@@ -134,5 +150,10 @@ export function validateConfig(): void {
   );
   console.log(
     `[noah] Vault: ${config.vault.enabled ? config.vault.path : "disabled"}`,
+  );
+  console.log(
+    `[noah] Vault bridge: ${
+      config.vaultBridge.enabled ? `enabled (device=${config.vaultBridge.deviceId})` : "disabled"
+    }`,
   );
 }

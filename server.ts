@@ -3,6 +3,16 @@ import { DB } from "./db";
 import { config, validateConfig } from "./config";
 import { chat } from "./noah";
 import { memoryClient } from "./memory-client";
+import { createModelClient } from "./model-client";
+import {
+  reconcileMemoryExports,
+  importMemoriesFromOtherDevices,
+  reconcileSessionSummaries,
+  reconcileObservations,
+  summarizeConversation,
+  buildObservationsFromConversation,
+  appendObservations,
+} from "./vault-bridge";
 import {
   extractText,
   classifyFile,
@@ -579,6 +589,92 @@ validateConfig();
 // (Bun binds the port only after this module finishes evaluating). Lazy first-token
 // model load is acceptable, and slow turns now survive (idleTimeout=255).
 await memoryClient.warmup();
+
+// --- Vault-bridge startup reconciliation (Phase 5B) ---
+// Run BEFORE serving so the first request lands with a coherent cross-device
+// view. Three passes, all bounded so a slow vault can never block boot for
+// more than a few seconds:
+//
+//   1. Export reconciliation: any memory.db row created after the manifest's
+//      high-water mark gets exported. Fast (one SELECT + N writes).
+//   2. Import: read other-device export files and import new memories via
+//      memory_remember. Bounded by the number of unprocessed files.
+//   3. Summary + observation reconciliation: deferred to a background task
+//      (after we start serving) because summary generation can take 2-5s per
+//      conversation and we don't want to delay port binding.
+
+try {
+  const exportResult = reconcileMemoryExports();
+  console.log(
+    `[vault-bridge] Export reconcile: ${exportResult.exported} exported, ${exportResult.skipped} skipped`,
+  );
+} catch (err) {
+  console.warn(
+    "[vault-bridge] Export reconcile failed:",
+    err instanceof Error ? err.message : err,
+  );
+}
+
+try {
+  const importResult = await importMemoriesFromOtherDevices();
+  console.log(
+    `[vault-bridge] Import: ${importResult.memoriesStored} stored, ${importResult.memoriesSkippedDuplicate} duplicates, ${importResult.memoriesFailed} failed, ${importResult.filesScanned} files scanned`,
+  );
+} catch (err) {
+  console.warn(
+    "[vault-bridge] Import failed:",
+    err instanceof Error ? err.message : err,
+  );
+}
+
+// Summaries + observations: fire-and-forget AFTER port binding so a slow
+// summarize doesn't block the launcher's health-check. Each summary involves
+// a model call; we cap at 5 per pass.
+(async () => {
+  try {
+    const summaryClient = createModelClient();
+    const sumR = await reconcileSessionSummaries(summaryClient, 5);
+    console.log(
+      `[vault-bridge] Summary reconcile: ${sumR.summarized} written, ${sumR.skipped} skipped`,
+    );
+    const obsR = reconcileObservations(5);
+    console.log(`[vault-bridge] Observations reconcile: ${obsR.written} written`);
+  } catch (err) {
+    console.warn(
+      "[vault-bridge] Background reconcile failed:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+})();
+
+// SIGTERM hook (Phase 5A best-effort): if the user (or a launcher) sends
+// SIGTERM, try to write a summary + observation for the most recently
+// updated conversation before exiting. Bounded by 10s so we don't hang on
+// shutdown. If this fails or times out, startup reconciliation on the next
+// boot catches it.
+const gracefulShutdown = async (signal: string) => {
+  console.log(`[noah] ${signal} received — flushing recent session before exit`);
+  try {
+    const summaryClient = createModelClient();
+    const recent = DB.listConversations(1, 0);
+    if (recent.length > 0) {
+      const convId = recent[0].id;
+      const summaryP = summarizeConversation(convId, summaryClient);
+      const obsBuilt = buildObservationsFromConversation(convId);
+      if (obsBuilt) appendObservations(obsBuilt);
+      // 10s cap on the summary write so shutdown doesn't hang.
+      await Promise.race([
+        summaryP,
+        new Promise((resolve) => setTimeout(resolve, 10_000)),
+      ]);
+    }
+  } catch (err) {
+    console.warn("[noah] graceful-shutdown flush failed:", err instanceof Error ? err.message : err);
+  }
+  process.exit(0);
+};
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 // Fire-and-forget local chat-model warm (pages qwen3.5:4b into VRAM in the
 // background so the first user turn is fast). Cloud has no cold-load — skipped.
