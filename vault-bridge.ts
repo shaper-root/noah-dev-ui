@@ -560,9 +560,21 @@ export interface SessionSummary {
   body: string;
 }
 
-/** Build the per-conversation file path: `_noah/sessions/YYYY-MM-DD_<device>_<N>.md`. */
-function sessionFilePath(date: string, device: string, n: number): string {
-  return `${SESSION_DIR}${date}_${device}_${n}.md`;
+/** Short, stable identifier for a conversation derived from its UUID. 8 hex
+ *  chars (~4B possibilities) is sufficient to disambiguate within a single
+ *  device's daily slate; the full UUID also lives in the file's frontmatter. */
+function shortConvId(conversationId: string): string {
+  return conversationId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8);
+}
+
+/** Build the per-conversation file path. Conversation-ID-based naming
+ *  (NOT date-based sequence): idempotency is O(1) `existsSync` on a
+ *  deterministic path, so a conversation never gets a second summary when
+ *  reconciliation re-runs, and a deleted file never causes the sequence to
+ *  drift onto a colliding write target. The date prefix keeps the directory
+ *  sortable by day. */
+function sessionFilePath(date: string, device: string, conversationId: string): string {
+  return `${SESSION_DIR}${date}_${device}_${shortConvId(conversationId)}.md`;
 }
 
 /** Compute structural stats from a conversation's persisted messages. The
@@ -707,17 +719,33 @@ export async function summarizeConversation(
   // Use the conversation's creation date as the session date — robust to
   // multi-day conversations (they're rare but the file gets pinned to start).
   const sessionDate = conv.created_at.slice(0, 10);
-  // Session number is N-th conversation by THIS device on this date. We can't
-  // know historical device assignment for old conversations, so just count
-  // existing summary files for the date+device and use N+1.
+
+  // Deterministic, conversation-ID-based path. O(1) existence check is the
+  // idempotency primary; the legacy-pattern content scan below is a
+  // backwards-compat fallback only.
+  const expectedPath = sessionFilePath(sessionDate, deviceId(), conversationId);
+  if (existsSync(vaultAbs(expectedPath))) {
+    if (!options.force) {
+      return { written: false, path: expectedPath, reason: "already-summarized" };
+    }
+  }
+
+  // Backwards compat: scan ALL existing same-date files for a frontmatter
+  // conversation_id match. Catches summaries written by the old sequence-
+  // numbered scheme (`{date}_{device}_{N}.md`). Without this, the first run
+  // after the fix would re-summarize every legacy file.
   const existingForDate = listSessionFiles(sessionDate, deviceId());
-  // Check if THIS conversation already has a summary (idempotency by ID).
   for (const f of existingForDate) {
+    if (`${SESSION_DIR}${f}` === expectedPath) continue; // already checked above
     try {
       const text = readFileSync(vaultAbs(`${SESSION_DIR}${f}`), "utf-8");
       if (text.includes(`conversation_id: ${conversationId}`)) {
         if (!options.force) {
-          return { written: false, path: `${SESSION_DIR}${f}`, reason: "already-summarized" };
+          return {
+            written: false,
+            path: `${SESSION_DIR}${f}`,
+            reason: "already-summarized (legacy)",
+          };
         }
       }
     } catch {
@@ -725,7 +753,6 @@ export async function summarizeConversation(
     }
   }
 
-  const sessionNumber = existingForDate.length + 1;
   const stats = statsFromMessages(messages);
 
   const body = await generateSummaryBody(
@@ -737,7 +764,6 @@ export async function summarizeConversation(
     device: deviceId(),
     conversation_id: conversationId,
     session_date: sessionDate,
-    session_number: sessionNumber,
     turn_count: stats.turnCount,
     duration_estimate_min: stats.durationMin,
     memories_stored: stats.memoriesStored,
@@ -745,16 +771,23 @@ export async function summarizeConversation(
     model: stats.modelId || "(unknown)",
     kernel: "v1.2.0", // current kernel; future: read from kernel.ts loaded version
   });
-  const header = `\n\n## Session Summary — ${deviceId()}, ${sessionDate} (#${sessionNumber})\n\n`;
+  const header = `\n\n## Session Summary — ${deviceId()}, ${sessionDate} (${shortConvId(conversationId)})\n\n`;
   const content = fm + header + body + "\n";
 
-  const path = sessionFilePath(sessionDate, deviceId(), sessionNumber);
-  const w = writeNote(path, content, { overwrite: false });
+  const w = writeNote(expectedPath, content, { overwrite: false });
   if (!w.ok) {
-    log("warn", "vault-bridge.summary.write_fail", { path, kind: w.kind });
+    log("warn", "vault-bridge.summary.write_fail", {
+      path: expectedPath,
+      kind: w.kind,
+      conv: conversationId,
+    });
     return { written: false, reason: w.error };
   }
-  return { written: true, path };
+  log("info", "vault-bridge.summary.write_ok", {
+    path: expectedPath,
+    conv: conversationId,
+  });
+  return { written: true, path: expectedPath };
 }
 
 function listSessionFiles(date: string, device: string): string[] {
@@ -811,21 +844,52 @@ export function readRecentSessionSummaries(maxFiles = 5): Array<{ path: string; 
 export async function reconcileSessionSummaries(
   modelClient: { chat: (msgs: Message[]) => Promise<{ content: string }> },
   maxSummaries = 5,
-): Promise<{ summarized: number; skipped: number }> {
-  if (!config.vaultBridge.enabled) return { summarized: 0, skipped: 0 };
+): Promise<{
+  summarized: number;
+  alreadySummarized: number;
+  tooShort: number;
+  failed: number;
+  scanned: number;
+}> {
+  if (!config.vaultBridge.enabled) {
+    return { summarized: 0, alreadySummarized: 0, tooShort: 0, failed: 0, scanned: 0 };
+  }
 
-  // Recent conversations only (most likely to need summarizing).
-  const recent = DB.listConversations(20, 0);
+  // Recent conversations — ordered by updated_at DESC so we catch the user's
+  // most-recent work first when capped by maxSummaries. Widened to 50 (from
+  // 20) so the cap is hit by the budget, not by the list size — when 8 new
+  // conversations land between boots, we still see all 8.
+  const recent = DB.listConversations(50, 0);
   let summarized = 0;
-  let skipped = 0;
+  let alreadySummarized = 0;
+  let tooShort = 0;
+  let failed = 0;
   for (const conv of recent) {
     if (summarized >= maxSummaries) break;
     const result = await summarizeConversation(conv.id, modelClient);
-    if (result.written) summarized++;
-    else skipped++;
+    if (result.written) {
+      summarized++;
+    } else if (result.reason?.startsWith("already-summarized")) {
+      alreadySummarized++;
+    } else if (result.reason === "too-short") {
+      tooShort++;
+    } else {
+      failed++;
+      log("warn", "vault-bridge.summary.conv_skipped", {
+        conv: conv.id,
+        reason: result.reason,
+      });
+    }
   }
-  log("info", "vault-bridge.summary.reconcile", { summarized, skipped });
-  return { summarized, skipped };
+  const breakdown = {
+    summarized,
+    alreadySummarized,
+    tooShort,
+    failed,
+    scanned: recent.length,
+  };
+  log("info", "vault-bridge.summary.reconcile", breakdown);
+  return breakdown;
 }
 
 // ── Observations (Phase 4) ───────────────────────────────────────────

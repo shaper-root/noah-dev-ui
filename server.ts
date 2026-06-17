@@ -635,7 +635,9 @@ try {
     const summaryClient = createModelClient();
     const sumR = await reconcileSessionSummaries(summaryClient, 5);
     console.log(
-      `[vault-bridge] Summary reconcile: ${sumR.summarized} written, ${sumR.skipped} skipped`,
+      `[vault-bridge] Summary reconcile: ${sumR.summarized} written, ` +
+        `${sumR.alreadySummarized} already-summarized, ${sumR.tooShort} too-short, ` +
+        `${sumR.failed} failed (scanned ${sumR.scanned})`,
     );
     const obsR = reconcileObservations(5);
     console.log(`[vault-bridge] Observations reconcile: ${obsR.written} written`);

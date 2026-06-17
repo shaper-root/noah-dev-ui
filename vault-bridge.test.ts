@@ -396,6 +396,89 @@ describe("session summaries readback", () => {
   });
 });
 
+describe("summarizeConversation: conv-id path + idempotency", () => {
+  // Stub model client that returns a synthetic body without any real cloud call.
+  const stubModel = {
+    chat: async () => ({ content: "### What we discussed\n(stub body)\n" }),
+  };
+
+  // Re-mock db.ts with controllable conversations for this describe block.
+  const fakeConvs = new Map<string, { id: string; created_at: string }>();
+  const fakeMessages = new Map<
+    string,
+    Array<{ id: string; role: string; content: string; metadata: string; created_at: string }>
+  >();
+  mock.module("./db", () => ({
+    DB: {
+      listConversations: () => [...fakeConvs.values()],
+      getConversation: (id: string) => fakeConvs.get(id) ?? null,
+      getMessages: (id: string) => fakeMessages.get(id) ?? [],
+    },
+  }));
+
+  test("writes to {date}_{device}_{conv8}.md path", async () => {
+    fakeConvs.clear();
+    fakeMessages.clear();
+    fakeConvs.set("b849a6c8-aaaa-bbbb-cccc-111111111111", {
+      id: "b849a6c8-aaaa-bbbb-cccc-111111111111",
+      created_at: "2026-06-17 10:00:00",
+    });
+    fakeMessages.set("b849a6c8-aaaa-bbbb-cccc-111111111111", [
+      { id: "1", role: "user", content: "hi", metadata: "{}", created_at: "2026-06-17 10:00:00" },
+      { id: "2", role: "assistant", content: "hello", metadata: "{}", created_at: "2026-06-17 10:00:01" },
+    ]);
+    const { summarizeConversation } = await import("./vault-bridge");
+    const r = await summarizeConversation("b849a6c8-aaaa-bbbb-cccc-111111111111", stubModel);
+    expect(r.written).toBe(true);
+    expect(r.path).toBe("_noah/sessions/2026-06-17_mac_b849a6c8.md");
+    expect(existsSync(resolve(TMP_VAULT, "_noah/sessions/2026-06-17_mac_b849a6c8.md"))).toBe(true);
+  });
+
+  test("idempotent: second call returns already-summarized without re-write", async () => {
+    const { summarizeConversation } = await import("./vault-bridge");
+    fakeConvs.clear();
+    fakeMessages.clear();
+    fakeConvs.set("c1c1c1c1-dddd-eeee-ffff-222222222222", {
+      id: "c1c1c1c1-dddd-eeee-ffff-222222222222",
+      created_at: "2026-06-17 11:00:00",
+    });
+    fakeMessages.set("c1c1c1c1-dddd-eeee-ffff-222222222222", [
+      { id: "1", role: "user", content: "hi", metadata: "{}", created_at: "2026-06-17 11:00:00" },
+      { id: "2", role: "assistant", content: "hi back", metadata: "{}", created_at: "2026-06-17 11:00:01" },
+    ]);
+    const r1 = await summarizeConversation("c1c1c1c1-dddd-eeee-ffff-222222222222", stubModel);
+    expect(r1.written).toBe(true);
+    const r2 = await summarizeConversation("c1c1c1c1-dddd-eeee-ffff-222222222222", stubModel);
+    expect(r2.written).toBe(false);
+    expect(r2.reason).toBe("already-summarized");
+    expect(r2.path).toBe("_noah/sessions/2026-06-17_mac_c1c1c1c1.md");
+  });
+
+  test("legacy sequence-numbered file still recognized via content fallback", async () => {
+    const { summarizeConversation } = await import("./vault-bridge");
+    fakeConvs.clear();
+    fakeMessages.clear();
+    fakeConvs.set("aaaa1111-bbbb-cccc-dddd-333333333333", {
+      id: "aaaa1111-bbbb-cccc-dddd-333333333333",
+      created_at: "2026-06-16 09:00:00",
+    });
+    fakeMessages.set("aaaa1111-bbbb-cccc-dddd-333333333333", [
+      { id: "1", role: "user", content: "x", metadata: "{}", created_at: "2026-06-16 09:00:00" },
+      { id: "2", role: "assistant", content: "y", metadata: "{}", created_at: "2026-06-16 09:00:01" },
+    ]);
+    // Pre-place a legacy-pattern summary with this conv_id in the frontmatter.
+    mkdirSync(resolve(TMP_VAULT, "_noah/sessions"), { recursive: true });
+    writeFileSync(
+      resolve(TMP_VAULT, "_noah/sessions/2026-06-16_mac_1.md"),
+      "---\ndevice: mac\nconversation_id: aaaa1111-bbbb-cccc-dddd-333333333333\nsession_date: 2026-06-16\n---\n\nlegacy body\n",
+    );
+    const r = await summarizeConversation("aaaa1111-bbbb-cccc-dddd-333333333333", stubModel);
+    expect(r.written).toBe(false);
+    expect(r.reason).toBe("already-summarized (legacy)");
+    expect(r.path).toBe("_noah/sessions/2026-06-16_mac_1.md");
+  });
+});
+
 describe("manifest", () => {
   test("loadManifest returns empty defaults when file missing", () => {
     const m = loadManifest();
