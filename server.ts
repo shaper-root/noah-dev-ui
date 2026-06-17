@@ -30,6 +30,7 @@ import { dreamRoutes } from "./routes/dream";
 import { rulesRoutes } from "./routes/rules";
 import { analyticsRoutes } from "./routes/analytics";
 import { formatSSE, formatSSEComment, type SSEEventName } from "./sse";
+import { loadVaultIndex } from "./vault-index";
 
 const app = new Hono();
 const PORT = 3333;
@@ -623,6 +624,22 @@ try {
 } catch (err) {
   console.warn(
     "[vault-bridge] Import failed:",
+    err instanceof Error ? err.message : err,
+  );
+}
+
+// Vault index (Level 1 awareness): generate + cache once at startup so the
+// first user turn isn't delayed by a vault walk. Reads only each note's head, so
+// even a 1000+ file vault is well under budget. Best-effort — a failure here
+// just means no awareness digest until the lazy load on first message.
+try {
+  const idx = loadVaultIndex();
+  console.log(
+    `[vault-index] ${idx.active ? `${idx.fileCount} notes across ${idx.dirCount} dirs` : "inactive"} (${idx.ms}ms)`,
+  );
+} catch (err) {
+  console.warn(
+    "[vault-index] Startup generation failed:",
     err instanceof Error ? err.message : err,
   );
 }

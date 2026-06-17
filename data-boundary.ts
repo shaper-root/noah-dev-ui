@@ -160,6 +160,10 @@ export interface VaultContentEntry {
   /** Stage 1: per-file provenance + trust (omitted → fail-safe to imported/0.5). */
   provenance?: Provenance;
   trust?: number;
+  /** Level 1 index: note title (first H1 or filename), surfaced on search hits. */
+  title?: string;
+  /** Level 1 index: H2 topic hints, surfaced on search hits to aid file selection. */
+  topics?: string[];
 }
 
 export function wrapVaultAsData(entries: VaultContentEntry[]): string {
@@ -172,6 +176,10 @@ export function wrapVaultAsData(entries: VaultContentEntry[]): string {
     const provenance: Provenance = e.provenance ?? "unknown";
     const trust = e.trust ?? TRUST_IMPORTED;
     lines.push(`[${i + 1}] file: ${e.path}`);
+    if (e.title) lines.push(`    title: ${e.title}`);
+    if (e.topics && e.topics.length) {
+      lines.push(`    topics: ${e.topics.join(", ")}`);
+    }
     lines.push(
       `    source: ${vaultSourceLabel(provenance)} | trust: ${Math.round(trust * 100)}% | provenance: ${provenance}`,
     );

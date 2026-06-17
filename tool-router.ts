@@ -11,6 +11,7 @@ import {
   vaultAvailable,
   vaultProvenance,
 } from "./vault";
+import { loadVaultIndex, refreshVaultIndex } from "./vault-index";
 
 // Schema-valid enum values. Kept here as the SINGLE source of truth for the
 // runtime coercion in dispatchTool (the tool defs above embed the same lists
@@ -270,16 +271,25 @@ const VAULT_TOOLS: ToolDef[] = [
       name: "vault_search",
       description:
         "Search Root's Obsidian vault (his curated markdown notes) by keyword. " +
-        "READ-ONLY. Returns matching files with snippets. Omit the query to get the " +
-        "total file count and a listing instead — use that to answer 'how many files' " +
-        "or 'what's in my vault'. Vault content carries 90% trust (Root's own notes).",
+        "READ-ONLY. Ranks by title and section-header (topic) matches, not just " +
+        "filename, and returns each hit's title + topic hints so you can pick what " +
+        "to read. Omit the query to get a vault overview instead (directory " +
+        "breakdown + the most recently modified notes) — use that to answer 'what's " +
+        "in my vault' or 'what topics do I have notes on'. Set refresh=true to " +
+        "rebuild the index when Root says it's stale. Vault content carries 90% " +
+        "trust (Root's own notes).",
       parameters: {
         type: "object",
         properties: {
           query: {
             type: "string",
             description:
-              "Keywords to search for. Omit or leave empty to list/count all files.",
+              "Keywords to search for. Omit or leave empty to get the vault overview.",
+          },
+          refresh: {
+            type: "boolean",
+            description:
+              "Rebuild the vault index before answering. Use when Root asks to refresh/re-scan the vault.",
           },
         },
         required: [],
@@ -424,15 +434,22 @@ export async function dispatchTool(
 
     case "vault_search": {
       const query = typeof args.query === "string" ? args.query.trim() : "";
-      // No query → listing/count mode (answers "how many files in my vault").
+      const refresh = args.refresh === true;
+      // Explicit refresh: rebuild the index before answering ("re-scan my vault").
+      if (refresh) refreshVaultIndex();
+      // No query → overview mode: the index digest (directory breakdown + most
+      // recent notes) answers "what's in my vault" / "what topics do I have".
       if (!query) {
+        const idx = loadVaultIndex();
         const stats = vaultStats();
         return JSON.stringify({
           source: "obsidian_vault",
           trust: config.vault.trust,
           total_files: stats.fileCount,
           total_bytes: stats.totalBytes,
-          note: "Vault listing — to read a file, call vault_read with its path.",
+          overview: idx.active ? idx.compactSummary : undefined,
+          refreshed: refresh || undefined,
+          note: "Vault overview — to read a file, call vault_read with its path.",
         });
       }
       const hits = searchVault(query);
@@ -449,6 +466,8 @@ export async function dispatchTool(
           const prov = vaultProvenance(h.path);
           return {
             path: h.path,
+            title: h.title,
+            topics: h.topics,
             text: h.snippet,
             provenance: prov.provenance,
             trust: prov.trust,

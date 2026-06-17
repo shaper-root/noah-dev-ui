@@ -11,6 +11,7 @@ import type { RecalledMemory } from "./memory-client";
 import { createKernel } from "./kernel-seam";
 import { loadKernel } from "./kernel";
 import { loadSelfKnowledge } from "./self-knowledge";
+import { getVaultIndexInjection } from "./vault-index";
 import { detectSkills } from "./skill-detect";
 import { log } from "./logger";
 import { memoryClient } from "./memory-client";
@@ -557,8 +558,18 @@ export async function* chat(
   const selfKnowledgeBlock = selfKnowledge.active
     ? `\n\n=== SELF-KNOWLEDGE (known weaknesses + active compensations) ===\n${selfKnowledge.text}\n=== END SELF-KNOWLEDGE ===\n`
     : "";
+  // Vault index (Level 1 awareness): a compact digest of what's in Root's vault
+  // — directory counts + the 20 most-recent notes with topic hints — so Noah
+  // knows its notes exist without searching blind. First message only: it's
+  // orientation, not per-turn reference; the full cached index still powers
+  // vault_search on every turn. Treated as DATA (fenced), not instruction.
+  const vaultIndexBlock = isFirstMessageOfSession ? getVaultIndexInjection() : "";
   const systemWithTime =
-    SYSTEM_PROMPT + kernelBlock + selfKnowledgeBlock + `\nCurrent time: ${timeStr}`;
+    SYSTEM_PROMPT +
+    kernelBlock +
+    selfKnowledgeBlock +
+    vaultIndexBlock +
+    `\nCurrent time: ${timeStr}`;
   const messages: Message[] = [
     { role: "system", content: systemWithTime },
     ...history.map(
