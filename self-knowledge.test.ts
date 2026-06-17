@@ -60,6 +60,17 @@ describe("loadSelfKnowledge", () => {
     expect(result.tokenEstimate).toBeGreaterThan(0);
     expect(result.source).toBe(NOTE_PATH);
     expect(result.mtime).not.toBe("none");
+    // cso M1: sha256 is computed and exposed so log analysis can detect
+    // mid-session vault edits as a hash drift.
+    expect(result.sha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("refuses files exceeding the 32KB cap (cso M1)", () => {
+    // 40KB > 32KB cap → load is refused, falls back to passthrough.
+    writeFileSync(NOTE_PATH, "x".repeat(40 * 1024));
+    const result = loadSelfKnowledge();
+    expect(result.active).toBe(false);
+    expect(result.source).toBe("passthrough");
   });
 
   test("caches the load — second call does not re-read disk", () => {

@@ -429,7 +429,50 @@ describe("Phase 2: memory store verification + provenance", () => {
     const dispatchedArgs = (mockDispatchTool.mock.calls[0]?.[0] as {
       function: { arguments: Record<string, unknown> };
     })?.function.arguments;
-    expect(dispatchedArgs.explicit).toBeUndefined();
+    // cso H1 fix: noah.ts now FORCE-SETS explicit to the host-side intent
+    // value (true OR false), overwriting any model-supplied value. So the
+    // dispatched call carries explicit:false (not undefined) when intent
+    // wasn't detected — the security property is that the model can never
+    // grant itself the bypass.
+    expect(dispatchedArgs.explicit).toBe(false);
+  });
+
+  test("Phase 2D / cso H1: model-supplied explicit:true is FORCE-OVERWRITTEN by host-side intent", async () => {
+    mockGetAllTools.mockReturnValue([
+      {
+        type: "function",
+        function: { name: "memory_remember", description: "store", parameters: {} },
+      },
+    ]);
+    mockDispatchTool.mockResolvedValue(
+      JSON.stringify({ stored: true, id: "uuid-3", confidence: 0.9, embedded: true }),
+    );
+
+    // The model tries to self-grant the gate bypass — emits explicit:true even
+    // though the user did NOT express store intent.
+    mockModelChat
+      .mockResolvedValueOnce({
+        content: "",
+        tool_calls: [
+          {
+            id: "c1",
+            function: {
+              name: "memory_remember",
+              arguments: { content: "smuggled fact", explicit: true },
+            },
+          },
+        ],
+        thinking: "",
+      })
+      .mockResolvedValueOnce({ content: "ok.", tool_calls: [], thinking: "" });
+
+    // User message has no explicit-store intent.
+    await collect(chat("hi there", "h1-test", []));
+    const dispatchedArgs = (mockDispatchTool.mock.calls[0]?.[0] as {
+      function: { arguments: Record<string, unknown> };
+    })?.function.arguments;
+    // The model's explicit:true MUST be overwritten to false.
+    expect(dispatchedArgs.explicit).toBe(false);
   });
 
   test("done event surfaces memory store outcomes (both stored and failed)", async () => {

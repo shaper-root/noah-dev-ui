@@ -15,9 +15,20 @@
  */
 
 import { readFileSync, statSync } from "fs";
+import { createHash } from "crypto";
 import { resolve } from "path";
 import { config } from "./config";
 import { log } from "./logger";
+
+/**
+ * Hard cap on the self-knowledge file size. The file is injected into the
+ * system prompt as instruction (no spotlighting fence) — an unbounded read
+ * would let a vault corruption or a malicious sync conflict balloon the
+ * system message and either OOM the model call or smuggle large prompt
+ * payloads. 32KB is generous for a behavioral mirror (current note is ~4KB)
+ * and tight enough that surprise growth is caught.
+ */
+const MAX_FILE_BYTES = 32 * 1024;
 
 export interface SelfKnowledgeLoad {
   /** Whether the text will actually be injected this run. */
@@ -30,6 +41,9 @@ export interface SelfKnowledgeLoad {
   source: string;
   /** File mtime when loaded — exposed for debugging stale caches. */
   mtime: string;
+  /** SHA-256 of the loaded text. Logged at load so any unauthorized
+   *  mid-session change shows up as a hash drift in the forensic trail. */
+  sha256: string;
 }
 
 const PASSTHROUGH: SelfKnowledgeLoad = {
@@ -38,6 +52,7 @@ const PASSTHROUGH: SelfKnowledgeLoad = {
   tokenEstimate: 0,
   source: "passthrough",
   mtime: "none",
+  sha256: "none",
 };
 
 const FILENAME = "Noah-Self-Knowledge.md";
@@ -72,6 +87,20 @@ export function loadSelfKnowledge(): SelfKnowledgeLoad {
       cached = PASSTHROUGH;
       return cached;
     }
+    // Hard cap (cso M1): refuse files larger than MAX_FILE_BYTES so a vault
+    // corruption / malicious sync conflict can't blow up the system prompt.
+    if (stat.size > MAX_FILE_BYTES) {
+      console.warn(
+        `[self-knowledge] ${FILENAME} is ${stat.size} bytes, exceeds ${MAX_FILE_BYTES} cap — refusing to load.`,
+      );
+      log("warn", "selfknowledge.oversize", {
+        path,
+        size: stat.size,
+        cap: MAX_FILE_BYTES,
+      });
+      cached = PASSTHROUGH;
+      return cached;
+    }
     text = readFileSync(path, "utf-8").trim();
     mtime = stat.mtime.toISOString();
   } catch (err) {
@@ -90,15 +119,19 @@ export function loadSelfKnowledge(): SelfKnowledgeLoad {
   }
 
   const tokenEstimate = estimateTokens(text);
-  cached = { active: true, text, tokenEstimate, source: path, mtime };
+  const sha256 = createHash("sha256").update(text).digest("hex");
+  cached = { active: true, text, tokenEstimate, source: path, mtime, sha256 };
 
   console.log(
-    `[self-knowledge] Loaded ${FILENAME} (~${tokenEstimate} tokens) from ${path}`,
+    `[self-knowledge] Loaded ${FILENAME} (~${tokenEstimate} tokens, sha256=${sha256.slice(0, 12)}…) from ${path}`,
   );
+  // sha256 in the structured log lets the session-review agent detect
+  // unauthorized mid-session vault edits as a hash drift in the trail.
   log("info", "selfknowledge.loaded", {
     source: path,
     tokens: tokenEstimate,
     mtime,
+    sha256,
   });
   return cached;
 }

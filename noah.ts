@@ -619,12 +619,16 @@ export async function* chat(
         });
 
         for (const n of normalized) {
-          // Phase 2D: inject explicit=true when the user's message had clear
-          // store intent. The MCP server then bypasses the worthiness gate so
-          // an explicit "remember this short fact" can't be silently dropped
-          // for being too short or near-duplicate.
-          if (n.name === "memory_remember" && explicitMemoryIntent) {
-            n.args.explicit = true;
+          // Phase 2D: set explicit from the host-side intent detector. We
+          // FORCE-SET in both directions (true AND false) — overwriting any
+          // model-supplied `explicit` is the security fix for cso H1: a
+          // prompt-injected/jailbroken model could otherwise emit
+          // "explicit":true on every memory_remember to self-bypass the
+          // worthiness gate. The MCP tool schema no longer advertises this
+          // parameter; only noah.ts ever sets it, and only based on the
+          // user-message regex.
+          if (n.name === "memory_remember") {
+            n.args.explicit = explicitMemoryIntent;
           }
 
           yield { type: "tool_call", data: JSON.stringify({ name: n.name, args: n.args }) };
