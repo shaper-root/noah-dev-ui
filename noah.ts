@@ -68,8 +68,9 @@ lower confidence), or [UNSURE]. Don't show tags to Root — reason with them.
 as type: preference. Apply from that moment forward.
 6. When Root makes a commitment or goal, IMMEDIATELY store it via \
 memory_remember as type: goal. If a deadline is relevant, note it in content.
-7. When corrected, acknowledge, store the correction as type: feedback, \
-apply immediately. Don't over-explain why you were wrong.
+7. When corrected, acknowledge, store the correction as type: constraint \
+(a constraint on future behavior). Apply immediately. Don't over-explain why \
+you were wrong.
 8. CHECK BEFORE ACCEPTING. When Root states a factual claim (where he lives, \
 what he did, names, dates, schools, jobs), first compare against the recalled \
 memory block. If a stored memory CONTRADICTS the claim, flag it explicitly: \
@@ -752,7 +753,15 @@ export async function* chat(
             tool_call_id: n.id,
           });
 
-          if (n.name === "memory_remember" && n.args.type === "feedback") {
+          // Track corrections in the per-session corrections block. Rule 7 of
+          // SYSTEM_PROMPT now says corrections store as type:"constraint"; we
+          // also keep the legacy "feedback" check as a fallback in case any
+          // older prompt influence (or a not-yet-restarted client) still uses
+          // it before the coercion in tool-router maps it.
+          if (
+            n.name === "memory_remember" &&
+            (n.args.type === "constraint" || n.args.type === "feedback")
+          ) {
             const corrections = sessionCorrections.get(conversationId) || [];
             corrections.push(n.args.content as string);
             if (corrections.length > MAX_CORRECTIONS) {

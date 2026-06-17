@@ -3,12 +3,83 @@ import { wrapWebResearchAsData, wrapVaultAsData } from "./data-boundary";
 import { memoryClient } from "./memory-client";
 import { webResearch } from "./web-research";
 import { config } from "./config";
+import { log } from "./logger";
 import {
   searchVault,
   readVaultFile,
   vaultStats,
   vaultAvailable,
 } from "./vault";
+
+// Schema-valid enum values. Kept here as the SINGLE source of truth for the
+// runtime coercion in dispatchTool (the tool defs above embed the same lists
+// so the model SEES them; this is the defense-in-depth check for when the
+// model emits an unlisted value anyway — e.g. text-parsed tool calls from a
+// non-tool-aware model, or hallucinated values).
+const VALID_TYPES = new Set([
+  "fact", "value", "preference", "constraint", "convention", "principle",
+  "goal", "relationship", "boundary", "event", "skill", "context",
+]);
+const VALID_CATEGORIES = new Set([
+  "permanent", "durable", "stable", "evolving", "volatile",
+]);
+
+/** Map common model-picked-but-invalid type values onto their closest
+ *  schema-valid equivalent. Anything not in this map AND not in VALID_TYPES
+ *  falls back to "fact" (the safe default). */
+const TYPE_COERCIONS: Record<string, string> = {
+  // Pre-fix tool-router had these — the model may still emit them from older
+  // prompt influence.
+  feedback: "constraint", // a correction is a constraint on future behavior
+  instruction: "constraint",
+  belief: "principle",
+  habit: "convention",
+  insight: "fact",
+  experience: "event",
+};
+
+/**
+ * Pure coercion of memory_remember's enum-constrained args to schema-valid
+ * values. Exported so the coercion is unit-testable WITHOUT mocking the
+ * memory-client singleton (which would compete with the process-global
+ * mock.module from noah.test.ts and vault-bridge.test.ts).
+ *
+ *  - `type`: schema-valid → unchanged. Mapped in TYPE_COERCIONS → mapped
+ *    value. Anything else → "fact". `undefined`/non-string → `undefined`
+ *    (the memory-api side defaults type:"fact").
+ *  - `category`: schema-valid → unchanged. Anything else → `undefined`
+ *    (NULL in the DB, which is explicitly valid).
+ *
+ * Logs a warn on any rewrite so pattern-drift surfaces in the structured log.
+ */
+export function coerceMemoryArgs(args: {
+  type?: unknown;
+  category?: unknown;
+}): { type?: string; category?: string } {
+  let type: string | undefined;
+  if (typeof args.type === "string") {
+    if (VALID_TYPES.has(args.type)) {
+      type = args.type;
+    } else {
+      const mapped = TYPE_COERCIONS[args.type] ?? "fact";
+      log("warn", "memory.write.coerce_type", { from: args.type, to: mapped });
+      type = mapped;
+    }
+  }
+  let category: string | undefined;
+  if (typeof args.category === "string") {
+    if (VALID_CATEGORIES.has(args.category)) {
+      category = args.category;
+    } else {
+      log("warn", "memory.write.coerce_category", {
+        from: args.category,
+        to: "(dropped → NULL)",
+      });
+      category = undefined;
+    }
+  }
+  return { type, category };
+}
 
 const MEMORY_TOOLS: ToolDef[] = [
   {
@@ -27,33 +98,37 @@ const MEMORY_TOOLS: ToolDef[] = [
           },
           type: {
             type: "string",
+            // MUST match the memory-api schema CHECK constraint
+            // (memory-api/src/storage/schema.ts). Any value outside this list
+            // is coerced to "fact" in dispatchTool before the MCP call. This
+            // enum had drifted (experience/belief/habit/instruction/feedback/
+            // insight were never schema-valid) and triggered late-write
+            // CHECK-constraint failures the model couldn't recover from.
             enum: [
               "fact",
+              "value",
               "preference",
-              "skill",
+              "constraint",
+              "convention",
+              "principle",
               "goal",
               "relationship",
-              "experience",
-              "belief",
-              "habit",
+              "boundary",
+              "event",
+              "skill",
               "context",
-              "instruction",
-              "feedback",
-              "insight",
             ],
             default: "fact",
             description: "Kind of memory",
           },
           category: {
             type: "string",
-            enum: [
-              "identity",
-              "stable",
-              "evolving",
-              "situational",
-              "ephemeral",
-            ],
-            description: "Volatility level",
+            // MUST match the schema (permanent/durable/stable/evolving/
+            // volatile or NULL). Any other value is dropped (NULL) in
+            // dispatchTool.
+            enum: ["permanent", "durable", "stable", "evolving", "volatile"],
+            description:
+              "Volatility tier (controls decay rate). Omit when unknown — NULL is valid.",
           },
           scope: {
             type: "string",
@@ -98,19 +173,20 @@ const MEMORY_TOOLS: ToolDef[] = [
           },
           type: {
             type: "string",
+            // Must match the schema for the filter to ever match a stored row.
             enum: [
               "fact",
+              "value",
               "preference",
-              "skill",
+              "constraint",
+              "convention",
+              "principle",
               "goal",
               "relationship",
-              "experience",
-              "belief",
-              "habit",
+              "boundary",
+              "event",
+              "skill",
               "context",
-              "instruction",
-              "feedback",
-              "insight",
             ],
             description: "Filter by memory type",
           },
@@ -282,9 +358,14 @@ export async function dispatchTool(
       // then bypasses the worthiness gate for the write.
       const explicit = args.explicit === true;
 
+      // Defense-in-depth: coerce type/category to schema-valid values so a
+      // model-picked out-of-enum value can't blow up the write with a CHECK
+      // constraint failure. See coerceMemoryArgs above.
+      const { type: safeType, category: safeCategory } = coerceMemoryArgs(args);
+
       const result = await memoryClient.remember(args.content, {
-        type: args.type,
-        category: args.category,
+        type: safeType,
+        category: safeCategory,
         scope: args.scope,
         entities: args.entities,
         keywords: args.keywords,

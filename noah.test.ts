@@ -77,9 +77,11 @@ mock.module("./kernel", () => ({
 // loader return passthrough deterministically, and not mocking here lets
 // self-knowledge.test.ts exercise the real module without bun's process-global
 // mock.module shadowing it.
-mock.module("./skill-detect", () => ({
-  detectSkills: () => [],
-}));
+// ./skill-detect is NOT mocked: the real module has no external deps,
+// no tests in this file assert on detectSkills output, and bun's
+// mock.module is process-global — a mock here leaks into
+// skill-detect.test.ts and breaks its assertions on the real
+// pattern-matching logic.
 
 const { chat } = await import("./noah");
 
