@@ -1,5 +1,13 @@
 import { config } from "./config";
 import { wrapAsData, wrapSessionSummariesAsData } from "./data-boundary";
+import {
+  detectConflictTags,
+  extractClaims,
+  vaultQueryForClaims,
+  type VaultFactInput,
+} from "./conflict-detector";
+import { searchVault, vaultProvenance, vaultAvailable } from "./vault";
+import type { RecalledMemory } from "./memory-client";
 import { createKernel } from "./kernel-seam";
 import { loadKernel } from "./kernel";
 import { loadSelfKnowledge } from "./self-knowledge";
@@ -482,7 +490,53 @@ export async function* chat(
         `continuity.\n`
       : "";
 
-  const userContext = `\n${memoryContext}${sessionSummariesBlock}${sessionPrep}\n\n[SESSION CORRECTIONS]\n${correctionsBlock}`;
+  // Stage 2: structural conflict detection (Approach C). Runs only when the
+  // user makes a checkable entity+value assertion. Checks the claim against
+  // BOTH the already-recalled memories AND a proactive vault search (each hit
+  // provenance-classified by Stage 1). Emits provenance-aware [MEMORY_CONFLICT]
+  // tags here — after retrieval, before generation. DETECT + INJECT only: it
+  // never resolves the conflict, never picks a winner, never mutates memory or
+  // vault (resolution = the disconfirmation-discipline skill + the human). A
+  // detector error must never break a turn, so it is fully swallowed.
+  let conflictBlock = "";
+  try {
+    const claims = extractClaims(userMessage);
+    if (claims.length > 0) {
+      let vaultFacts: VaultFactInput[] = [];
+      if (vaultAvailable()) {
+        const hits = searchVault(vaultQueryForClaims(claims));
+        vaultFacts = hits.map((h) => {
+          const prov = vaultProvenance(h.path);
+          return {
+            path: h.path,
+            text: h.snippet,
+            provenance: prov.provenance,
+            trust: prov.trust,
+          };
+        });
+      }
+      const memoriesForConflict = (recallResult.memories ?? []) as unknown as RecalledMemory[];
+      const tags = detectConflictTags(userMessage, memoriesForConflict, vaultFacts);
+      if (tags.length > 0) {
+        conflictBlock =
+          "\n\n[MEMORY CONFLICTS — surface these to Root and ask which is right; " +
+          "do NOT auto-resolve or overwrite stored facts]\n" +
+          tags.join("\n");
+        log("info", "conflict.detected", {
+          cid: conversationId,
+          count: tags.length,
+          vault_checked: vaultFacts.length,
+        });
+      }
+    }
+  } catch (err) {
+    log("warn", "conflict.detect.fail", {
+      cid: conversationId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  const userContext = `\n${memoryContext}${sessionSummariesBlock}${conflictBlock}${sessionPrep}\n\n[SESSION CORRECTIONS]\n${correctionsBlock}`;
   const augmentedUserMessage = kernelResult.processedMessage + userContext;
 
   // Injection order: [system prompt] → [kernel] → [self-knowledge] → [memory] → [user].

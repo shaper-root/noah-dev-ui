@@ -719,3 +719,70 @@ describe("Phase 2: memory store verification + provenance", () => {
     expect(done.memory_stores[0].stored).toBe(true);
   });
 });
+
+describe("conflict detection integration (Stage 2)", () => {
+  const conflictingMem = {
+    count: 1,
+    signals: {},
+    totalMs: 0,
+    memories: [
+      {
+        id: "mem-conflict",
+        content: "Root graduated from Colby College in 2005.",
+        type: "fact",
+        category: "stable",
+        scope: "personal",
+        source: "conversation",
+        entities: [],
+        keywords: [],
+        confidence: 0.9,
+        created_at: "2026-01-01T00:00:00Z",
+        score: 1,
+      },
+    ],
+  };
+
+  function messagesSent(): Array<{ role: string; content: string }> {
+    return mockModelChat.mock.calls[0][0] as Array<{ role: string; content: string }>;
+  }
+  function lastUserMessage(): string {
+    return [...messagesSent()].reverse().find((m) => m.role === "user")?.content ?? "";
+  }
+  function systemMessage(): string {
+    return messagesSent().find((m) => m.role === "system")?.content ?? "";
+  }
+
+  test("injects a provenance-aware [MEMORY_CONFLICT] tag, after retrieval + on the user turn (before generation)", async () => {
+    mockRecall.mockResolvedValueOnce(conflictingMem);
+    await collect(chat("I graduated from Bowdoin College.", "conflict-int-1", []));
+
+    expect(mockModelChat).toHaveBeenCalled();
+    const userMsg = lastUserMessage();
+    expect(userMsg).toContain("[MEMORY_CONFLICT");
+    expect(userMsg).toContain('stored="Colby College"');
+    expect(userMsg).toContain("source=conversation");
+    expect(userMsg).toContain('claimed="Bowdoin College"');
+
+    // position: AFTER the recalled-memory block (retrieval), within the user turn
+    const memIdx = userMsg.indexOf("No relevant memories found.");
+    const conflictIdx = userMsg.indexOf("[MEMORY_CONFLICT");
+    expect(memIdx).toBeGreaterThanOrEqual(0);
+    expect(conflictIdx).toBeGreaterThan(memIdx);
+
+    // the tag rides the USER turn, never the system prompt
+    expect(systemMessage()).not.toContain("MEMORY_CONFLICT");
+    // injected BEFORE generation: it is present in the messages handed to the model call
+  });
+
+  test("no tag when the user asks a QUESTION (no assertion), even against a contradicting memory", async () => {
+    mockRecall.mockResolvedValueOnce(conflictingMem);
+    await collect(chat("Where did I go to college?", "conflict-int-2", []));
+    expect(lastUserMessage()).not.toContain("MEMORY_CONFLICT");
+  });
+
+  test("no tag when nothing stored contradicts the claim", async () => {
+    mockRecall.mockResolvedValueOnce(EMPTY_RECALL);
+    await collect(chat("I graduated from Bowdoin College.", "conflict-int-3", []));
+    expect(lastUserMessage()).not.toContain("MEMORY_CONFLICT");
+  });
+});

@@ -155,6 +155,22 @@ export function topLevelFolder(relPath: string): string {
   return (i === -1 ? "" : norm.slice(0, i)).toLowerCase();
 }
 
+/**
+ * Stable source label for a provenance value. Consumed by the data-boundary
+ * vault wrappers (Stage 1) AND the conflict-detector tag (Stage 2). Lives here
+ * (pure, dependency-free) so the detector never has to import from data-boundary.
+ */
+export function vaultSourceLabel(provenance: Provenance): string {
+  switch (provenance) {
+    case "authored":
+      return "vault_authored";
+    case "imported":
+      return "vault_imported";
+    default:
+      return "vault_unknown";
+  }
+}
+
 const authored = (): ProvenanceResult => ({ provenance: "authored", trust: TRUST_AUTHORED });
 const imported = (): ProvenanceResult => ({ provenance: "imported", trust: TRUST_IMPORTED });
 const unknown = (): ProvenanceResult => ({ provenance: "unknown", trust: TRUST_IMPORTED });
