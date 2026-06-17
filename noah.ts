@@ -1,5 +1,5 @@
 import { config } from "./config";
-import { wrapAsData } from "./data-boundary";
+import { wrapAsData, wrapSessionSummariesAsData } from "./data-boundary";
 import { createKernel } from "./kernel-seam";
 import { loadKernel } from "./kernel";
 import { loadSelfKnowledge } from "./self-knowledge";
@@ -457,14 +457,11 @@ export async function* chat(
     try {
       const recent = readRecentSessionSummaries(3);
       if (recent.length > 0) {
-        sessionSummariesBlock =
-          "\n\n[RECENT SESSION SUMMARIES — cross-device continuity, from the vault]\n" +
-          recent
-            .map(
-              (s, i) =>
-                `--- summary ${i + 1}: ${s.path} ---\n${s.text}\n--- end summary ${i + 1} ---`,
-            )
-            .join("\n\n");
+        // Route session summaries through the same structured provenance +
+        // spotlighting treatment as vault_search/vault_read. They arrive already
+        // classified (they live in _noah/ → imported, 0.5), so they are never
+        // surfaced unlabeled or as authoritative.
+        sessionSummariesBlock = "\n\n" + wrapSessionSummariesAsData(recent);
       }
     } catch (err) {
       log("warn", "vault-bridge.summaries.read_fail", {

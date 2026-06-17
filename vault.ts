@@ -33,8 +33,12 @@ import {
   writeFileSync,
   appendFileSync,
   mkdirSync,
+  openSync,
+  readSync,
+  closeSync,
 } from "fs";
 import { resolve, relative, sep, extname, dirname } from "path";
+import { classifyProvenance, type ProvenanceResult } from "./provenance";
 import { config } from "./config";
 import { log } from "./logger";
 
@@ -538,4 +542,54 @@ export function readVaultFile(relPath: string): VaultReadResult {
       error: `Could not read file: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
+}
+
+// ── PROVENANCE (Okeanos Sprint 1, Stage 1) ───────────────────────────────────
+//
+// Every vault file Noah surfaces carries a provenance bit: did Root author it
+// (trust 0.9) or was it ingested from outside Root's own writing (trust 0.5)?
+// The classification logic is pure (provenance.ts); this is the read-only fs
+// glue that hands it the file's frontmatter. It NEVER mutates a vault file.
+
+/** Bytes read from a file head when we only need its frontmatter for provenance. */
+const FRONTMATTER_READ_CAP = 4096;
+
+/**
+ * Read only the leading bytes of a vault file (jailed via safeResolve,
+ * read-only, bounded to FRONTMATTER_READ_CAP) — enough to parse frontmatter.
+ * Returns "" on any access failure. Opens with mode "r" and never writes.
+ */
+function readVaultHead(relPath: string): string {
+  const abs = safeResolve(relPath.split("/").join(sep));
+  if (!abs) return "";
+  let fd: number | undefined;
+  try {
+    fd = openSync(abs, "r");
+    const buf = Buffer.alloc(FRONTMATTER_READ_CAP);
+    const n = readSync(fd, buf, 0, FRONTMATTER_READ_CAP, 0);
+    return buf.subarray(0, n).toString("utf-8");
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* fd already gone — nothing to do */
+      }
+    }
+  }
+}
+
+/**
+ * Provenance + trust for a surfaced vault file (Stage 1). READ-ONLY: derived
+ * from the path + the file's frontmatter; the vault file is never modified.
+ * Pass `content` when the caller already read the whole file (vault_read) to
+ * avoid a second read; otherwise only the file head is read (vault_search hits).
+ * Fails safe: any access/parse failure leaves classification to path alone,
+ * and an undeterminable path resolves to unknown/0.5.
+ */
+export function vaultProvenance(relPath: string, content?: string): ProvenanceResult {
+  const head = content ?? readVaultHead(relPath);
+  return classifyProvenance(relPath, head);
 }

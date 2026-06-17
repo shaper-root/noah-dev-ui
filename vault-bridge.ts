@@ -31,7 +31,8 @@ import { resolve } from "path";
 import { existsSync, readFileSync, readdirSync } from "fs";
 import { config } from "./config";
 import { log } from "./logger";
-import { writeNote, appendToNote } from "./vault";
+import { writeNote, appendToNote, vaultProvenance } from "./vault";
+import type { Provenance } from "./provenance";
 import { memoryClient, type RememberResult } from "./memory-client";
 import { DB } from "./db";
 import type { Message } from "./model-client";
@@ -805,8 +806,12 @@ function listSessionFiles(date: string, device: string): string[] {
 
 /** Read the N most recent session summary files for context injection on
  *  session start. Returns parsed Markdown bodies (the model can read them
- *  directly) sorted newest-first. */
-export function readRecentSessionSummaries(maxFiles = 5): Array<{ path: string; text: string }> {
+ *  directly) sorted newest-first. Each carries Stage-1 provenance — these live
+ *  in _noah/ (Noah's own machine-written logs) so they classify as imported
+ *  (trust 0.5); the caller surfaces them with that label, never as authoritative. */
+export function readRecentSessionSummaries(
+  maxFiles = 5,
+): Array<{ path: string; text: string; provenance: Provenance; trust: number }> {
   const dir = vaultAbs(SESSION_DIR);
   if (!existsSync(dir)) return [];
   try {
@@ -816,7 +821,8 @@ export function readRecentSessionSummaries(maxFiles = 5): Array<{ path: string; 
       .reverse() // newest first by lexicographic date prefix
       .slice(0, maxFiles);
     return files.map((f) => {
-      const abs = vaultAbs(`${SESSION_DIR}${f}`);
+      const path = `${SESSION_DIR}${f}`;
+      const abs = vaultAbs(path);
       let text = "";
       try {
         const buf = readFileSync(abs, "utf-8");
@@ -826,7 +832,9 @@ export function readRecentSessionSummaries(maxFiles = 5): Array<{ path: string; 
       } catch {
         /* skip */
       }
-      return { path: `${SESSION_DIR}${f}`, text };
+      // Classify from the (already-read) head — _noah/ → imported/0.5.
+      const prov = vaultProvenance(path, text);
+      return { path, text, provenance: prov.provenance, trust: prov.trust };
     });
   } catch {
     return [];

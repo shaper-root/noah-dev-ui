@@ -9,6 +9,7 @@ import {
   readVaultFile,
   vaultStats,
   vaultAvailable,
+  vaultProvenance,
 } from "./vault";
 
 // Schema-valid enum values. Kept here as the SINGLE source of truth for the
@@ -438,7 +439,15 @@ export async function dispatchTool(
         });
       }
       return wrapVaultAsData(
-        hits.map((h) => ({ path: h.path, text: h.snippet })),
+        hits.map((h) => {
+          const prov = vaultProvenance(h.path);
+          return {
+            path: h.path,
+            text: h.snippet,
+            provenance: prov.provenance,
+            trust: prov.trust,
+          };
+        }),
       );
     }
 
@@ -448,11 +457,14 @@ export async function dispatchTool(
       if (!result.ok) {
         return JSON.stringify({ source: "obsidian_vault", error: result.error });
       }
+      const prov = vaultProvenance(result.path!, result.content!);
       return wrapVaultAsData([
         {
           path: result.path!,
           text: result.content!,
           truncated: result.truncated,
+          provenance: prov.provenance,
+          trust: prov.trust,
         },
       ]);
     }

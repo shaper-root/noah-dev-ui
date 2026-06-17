@@ -27,6 +27,7 @@ mock.module("./logger", () => ({ log: () => {} }));
 mock.module("./data-boundary", () => ({
   wrapAsData: () => "No relevant memories found.",
   wrapWebResearchAsData: () => "",
+  wrapSessionSummariesAsData: () => "",
 }));
 mock.module("./kernel-seam", () => ({
   createKernel: () => ({
