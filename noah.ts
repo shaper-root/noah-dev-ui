@@ -402,7 +402,18 @@ export async function* chat(
         : explicitRecall
           ? 20
           : 10;
-    recallResult = await memoryClient.recall(retrievalQuery, { topK }) as typeof recallResult;
+    // INTERIM two-mode recall (see memory-api/src/pipeline/recency.ts): the
+    // session-start recap is a known recency-dominant query, so the
+    // first-message recall requests recency-weighted ranking to surface
+    // *today's* threads over older content-equivalent ones. Every OTHER recall
+    // (ambient, explicit, vague, model-issued) keeps the default 'relevance'
+    // mode — this does NOT impose recency on normal or deep-recall queries.
+    // Relevance-quality (resemblance != relevance) and dynamic per-query
+    // weighting are the tracked Stage 2/3 fix, not this.
+    recallResult = await memoryClient.recall(retrievalQuery, {
+      topK,
+      ...(isFirstMessageOfSession && { mode: "recency_weighted" as const }),
+    }) as typeof recallResult;
     retrieveMs = Date.now() - startTime;
     log("info", "recall.ok", {
       cid: conversationId,
