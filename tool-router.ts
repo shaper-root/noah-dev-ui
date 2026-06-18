@@ -276,8 +276,9 @@ const VAULT_TOOLS: ToolDef[] = [
         "to read. Omit the query to get a vault overview instead (directory " +
         "breakdown + the most recently modified notes) — use that to answer 'what's " +
         "in my vault' or 'what topics do I have notes on'. Set refresh=true to " +
-        "rebuild the index when Root says it's stale. Vault content carries 90% " +
-        "trust (Root's own notes).",
+        "rebuild the index when Root says it's stale. Each result carries its own " +
+        "per-file provenance + trust tag — read it; trust is not a blanket (most " +
+        "files are unverified/~0.5, only confirmed Root-authored locations are ~0.9).",
       parameters: {
         type: "object",
         properties: {
@@ -444,12 +445,16 @@ export async function dispatchTool(
         const stats = vaultStats();
         return JSON.stringify({
           source: "obsidian_vault",
-          trust: config.vault.trust,
           total_files: stats.fileCount,
           total_bytes: stats.totalBytes,
           overview: idx.active ? idx.compactSummary : undefined,
           refreshed: refresh || undefined,
-          note: "Vault overview — to read a file, call vault_read with its path.",
+          // No blanket vault trust: trust is PER FILE, surfaced when you actually
+          // vault_read a specific file (provenance.ts), not a vault-wide score.
+          note:
+            "Vault overview (file listing + counts). Trust is per-file — surfaced " +
+            "when you vault_read a specific file, not a blanket vault score. To read " +
+            "a file, call vault_read with its path.",
         });
       }
       const hits = searchVault(query);

@@ -20,8 +20,9 @@
  *    writes too: a Shannon-named write target is rejected.
  *  - Size-capped reads (config.vault.maxFileBytes) and writes (NOAH_MAX_WRITE_BYTES).
  *
- * Trust: vault content is labeled at config.vault.trust (0.9) — above conversation
- * memories (0.85), below seed (1.0). See data-boundary.wrapVaultAsData.
+ * Trust: vault content is classified PER FILE by provenance.ts (authored 0.9 for
+ * confirmed Root-authored locations, unverified 0.5 for everything else) — NOT a
+ * blanket vault default. See vaultProvenance() and data-boundary.wrapVaultAsData.
  */
 
 import {
