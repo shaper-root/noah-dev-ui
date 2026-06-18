@@ -634,6 +634,36 @@ describe("Phase 2: memory store verification + provenance", () => {
     expect(capturedTopK).toBe(30);
   });
 
+  test("INTERIM recency wiring: first message of a session requests recency_weighted recall", async () => {
+    let capturedMode: string | undefined;
+    mockRecall.mockImplementation(async (_q: string, opts?: { mode?: string }) => {
+      capturedMode = opts?.mode;
+      return EMPTY_RECALL;
+    });
+
+    // Empty history === first message of session → the session-start recap path.
+    await collect(chat("hey, what's up", "rw-first", []));
+    expect(capturedMode).toBe("recency_weighted");
+  });
+
+  test("INTERIM recency wiring: non-first messages use default relevance recall (no recency mode)", async () => {
+    // Seed with a sentinel so a never-called recall also fails the assertion.
+    let capturedMode: string | undefined = "unset";
+    mockRecall.mockImplementation(async (_q: string, opts?: { mode?: string }) => {
+      capturedMode = opts?.mode;
+      return EMPTY_RECALL;
+    });
+
+    // Non-empty history → NOT the first message → mode is omitted (default relevance).
+    await collect(
+      chat("and another thing", "rw-second", [
+        { role: "user", content: "earlier message" },
+        { role: "assistant", content: "earlier reply" },
+      ]),
+    );
+    expect(capturedMode).toBeUndefined();
+  });
+
   test("Phase 6A: session_start_brief flag fires only when memory has something to brief on", async () => {
     // History empty AND recall returns one memory → flag true.
     mockRecall.mockResolvedValueOnce({

@@ -294,6 +294,13 @@ class MemoryClient {
       type?: string;
       scope?: string;
       entities?: string[];
+      /**
+       * Retrieval mode. Omit (or 'relevance') for the default
+       * content-relevance ranking. 'recency_weighted' biases toward fresher
+       * memories — INTERIM, used ONLY for the session-start recap recall (see
+       * noah.ts first-message path). Threads host → MCP → retrieveMemories.
+       */
+      mode?: 'relevance' | 'recency_weighted';
     },
   ): Promise<RecallResult> {
     const empty: RecallResult = {
@@ -314,6 +321,7 @@ class MemoryClient {
             ...(opts?.type && { type: opts.type }),
             ...(opts?.scope && { scope: opts.scope }),
             ...(opts?.entities && { entities: opts.entities }),
+            ...(opts?.mode && { mode: opts.mode }),
           },
         }),
         config.mcpToolTimeoutMs,
