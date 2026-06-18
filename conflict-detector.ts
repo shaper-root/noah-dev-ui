@@ -29,6 +29,7 @@
 
 import type { RecalledMemory } from "./memory-client";
 import { type Provenance, vaultSourceLabel } from "./provenance";
+import { neutralizeFramingChars } from "./data-framing";
 
 /** A vault file surfaced for conflict-checking, already provenance-classified. */
 export interface VaultFactInput {
@@ -156,14 +157,15 @@ function splitSentences(text: string): string[] {
 }
 
 function sanitizeValue(value: string): string {
-  return value
-    .replace(/<<<|>>>/g, (m) => m[0] + "​" + m.slice(1)) // neutralize data fences
-    // Strip quotes/newlines AND square brackets so a malicious stored value can
-    // never close the quoted field early, break a line, or forge a second
-    // [MEMORY_CONFLICT] tag once interpolated. (The VAL char-class already
-    // excludes brackets at capture time; this is explicit defense-in-depth so
-    // the guarantee survives any future loosening of the pattern.)
-    .replace(/["\n[\]]/g, " ")
+  // Fence + entry-frame neutralization (strip <<<,>>>, quotes, newlines, square
+  // brackets) is shared with data-boundary's serializer via
+  // data-framing.neutralizeFramingChars — the single defense that stops a
+  // malicious stored value from closing the quoted field early, breaking a
+  // line, or forging a second [MEMORY_CONFLICT] tag once interpolated. (The VAL
+  // char-class already excludes brackets at capture time; this is explicit
+  // defense-in-depth so the guarantee survives any future loosening.) The rest
+  // — whitespace collapse, trim, length cap — is local to the short tag value.
+  return neutralizeFramingChars(value)
     .replace(/\s+/g, " ")
     .trim()
     // strip leading/trailing punctuation (sentence period, comma, quote) without

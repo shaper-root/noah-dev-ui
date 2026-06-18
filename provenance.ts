@@ -1,26 +1,49 @@
-// Vault content provenance + trust classification — Okeanos Sprint 1, Stage 1.
+// Vault content provenance + trust classification — Okeanos Sprint 2 hardening.
 //
-// SECURITY (read this before editing the folder lists below):
+// SECURITY — DEFAULT-LOW, NARROW-AUTHORED-ALLOWLIST (read before editing lists):
 // This module decides whether a surfaced vault file is treated as AUTHORED
-// (Root's own writing, trust 0.9) or IMPORTED (ingested external/machine
-// content, trust 0.5). Imported content is a prompt-injection surface — the
-// conflict detector (Stage 2) injects vault content into the model's context,
-// so imported content must NEVER be presented as authoritative. Therefore the
-// rule fails SAFE: anything not positively identified as authored is demoted to
-// imported/unknown (0.5). A file wrongly demoted costs one extra confirmation;
-// a file wrongly promoted is an injection vector.
+// (Root's own writing, trust 0.9) or IMPORTED/UNKNOWN (ingested or unverified
+// content, trust 0.5). The conflict detector (Stage 2) injects vault content
+// into the model's context, so anything presented as AUTHORED is treated as
+// authoritative against the user — an over-trusted file is a prompt-injection
+// vector into Noah's own reasoning.
 //
-// This module is PURE (no filesystem, no mutation): classification is derived
-// from the vault-relative path + (optionally) the file's already-read
-// frontmatter. It never writes to, moves, or deletes a vault file. The fs glue
-// that reads a file's frontmatter lives in vault.ts (vaultProvenance()).
+// THE POSTURE (flipped 2026-06-18, audit-okeanos-fullstack-2026-06-17):
+// authored/0.9 is reachable ONLY via a positive, explicit, UNFORGEABLE signal —
+// membership in AUTHORED_ALLOWLIST, a curated set of known-Root-authored
+// LOCATIONS. EVERYTHING ELSE — loose-root files, unmarked folders, ingested
+// content, anything ambiguous — defaults to 0.5. Trust is granted on the
+// PRESENCE of an authorship signal, NEVER on the ABSENCE of a demotion signal
+// (the confirmation-bias error disconfirmation-discipline names: "no reason to
+// distrust" is not "a reason to trust").
+//   - Under-trust is SAFE: Noah surfaces an authored file for confirmation —
+//     mild friction, the Elenchus principle handles it gracefully.
+//   - Over-trust is the INJECTION VECTOR. So 0.9 is made HARD to reach.
 //
-// DECISION (Sprint 1, folder-first): the top-level vault folder is the primary
-// trust signal. `created_by`/`generated_by` is a NARROW secondary signal that
-// only demotes on genuinely-external ingest values (n8n / auto-ingested /
-// morning-brief / web clippers) — NOT on the user's own migration markers
-// (bulk import / V2 migration / seed-synthesis), which would otherwise wrongly
-// demote ~463 authored library files that were bulk-migrated into the vault.
+// Two live holes this posture closes (audit 2026-06-17):
+//   1. LOOSE-ROOT SELF-INJECTION (critical). `folder === ""` used to return 0.9,
+//      and the vault root holds Noah-Self-Knowledge.md — a file NOAH ITSELF
+//      writes and edits every session. Noah's own output at authored-trust was a
+//      self-injection loop into its own conflict-detector. Loose root now → 0.5.
+//   2. BULK-IMPORT BLANKET (high). 02-library was folder-authored while 373/475
+//      of its files carry `created_by: bulk import` — external scrapes swept in
+//      by bulk import kept 0.9. 02-library is no longer allowlisted → 0.5.
+//
+// And the latent FORGERY: provenance is NEVER read from a field the file
+// controls (`created_by`/`author`/`updated_by` inside its own frontmatter) as a
+// PROMOTION signal — a file asserting its own authorship is the SEC-1 self-
+// promotion class. Authorship comes from LOCATION only (path / an external index
+// the content cannot write to). Content-controlled fields are read ONLY to
+// DEMOTE (external-ingest markers), never to raise trust.
+//
+// INTERIM SCALAR — the ideal is an edit-history LOG, not a single trust label;
+// vault files are co-edited (Root drafts → agents edit, and vice-versa) and one
+// per-file label cannot capture that. Default-low + narrow-authored-allowlist is
+// the safe interim until the log exists. See docs/provenance-edit-log-future.md.
+//
+// PURE MODULE: classification derives from the vault-relative path + the
+// already-read frontmatter. It never writes to, moves, or deletes a vault file.
+// The fs glue that reads a file's head lives in vault.ts (vaultProvenance()).
 
 export type Provenance = "authored" | "imported" | "unknown";
 
@@ -33,50 +56,65 @@ export interface ProvenanceResult {
 export const TRUST_AUTHORED = 0.9;
 export const TRUST_IMPORTED = 0.5; // imported AND unknown both fail-safe to 0.5
 
-// ── THE TRUST BOUNDARY — audit these lists ───────────────────────────────────
-// Top-level vault folders Root authored. Bulk-migrated content here is still
-// Root's own curated knowledge → authored. If any of these folders actually
-// holds ingested/external material, move it to IMPORT_FOLDERS: a file wrongly
-// left here gets 0.9, which is the only direction that opens an injection hole.
-export const AUTHORED_FOLDERS: ReadonlySet<string> = new Set([
-  "02-library",
-  "05-projects",
-  "00-dashboard",
-  "_agent",
-  "_archive",
-  "short story", // matched case-insensitively
+// ── THE AUTHORED ALLOWLIST — the ONLY path to 0.9 (audit this list) ───────────
+// Top-level vault folders that are GENUINELY Root-authored AND not swept with
+// imports. A file reaches authored/0.9 ONLY by living here. Membership is a
+// POSITIVE, location-based signal the file's own content cannot forge.
+//
+// ERR NARROW. A folder left OFF this list defaults to 0.5 — the SAFE direction
+// (one extra confirmation). A folder wrongly ADDED is an injection hole. Do NOT
+// add a folder unless it is known-Root-authored AND free of ingested / bulk-
+// imported / agent-written content. When in doubt, leave it off.
+//
+// ── FLAGGED FOR OPERATOR CONFIRMATION (2026-06-18 flip) ──
+//   ACTIVE (proposed minimal list):
+//     "short story" — Root's creative writing; no import pipeline. High confidence.
+//   CANDIDATE — left OFF pending operator confirmation:
+//     "05-projects" — Root's project notes. Add IFF confirmed free of pasted /
+//                     ingested external material. Until confirmed it is 0.5 (safe).
+//   DELIBERATELY REMOVED from the old authored set (now default to 0.5):
+//     "02-library"        — 373/475 files are `created_by: bulk import` (hole #2)
+//     "00-dashboard"      — holds machine-generated daily briefs
+//     "_agent","_archive" — agent-written output, not Root-authored
+//     loose root ("")     — holds Noah-Self-Knowledge.md, Noah's own writes (hole #1)
+export const AUTHORED_ALLOWLIST: ReadonlySet<string> = new Set([
+  "short story", // matched case-insensitively (topLevelFolder lowercases)
 ]);
 
-// Folders that hold ingested / machine-written content → imported (0.5).
-//   04-intel : n8n / Readwise signal pipeline (real external content)
-//   _noah    : Noah's own machine-written session/observation logs
-export const IMPORT_FOLDERS: ReadonlySet<string> = new Set(["04-intel", "_noah"]);
-
-// Mixed folder: authored relationship notes interleaved with bulk-imported
-// contacts. Defaults to imported (fail-safe); a per-file authored marker promotes.
-export const MIXED_FOLDERS: ReadonlySet<string> = new Set(["03-outreach"]);
+// Known import / machine-written / mixed folders → imported (0.5). With the
+// default-low posture these no longer NEED to demote (the default already does),
+// but membership carries the honest `imported` label (vs the default `unknown`)
+// so the data-boundary framing names the source correctly.
+//   04-intel    : n8n / Readwise signal pipeline (real external content)
+//   _noah       : Noah's own machine-written session / observation logs
+//   03-outreach : authored relationship notes interleaved with bulk-imported
+//                 contacts — mixed, so labeled imported (NO per-file promotion).
+export const IMPORT_FOLDERS: ReadonlySet<string> = new Set([
+  "04-intel",
+  "_noah",
+  "03-outreach",
+]);
 
 // created_by / generated_by / source values that signal genuinely-external
-// ingestion → demote even inside an authored folder. Lowercased; matched exact.
+// ingestion → demote to imported, OVERRIDING the authored allowlist. Lowercased;
+// matched exact. Belt-and-suspenders now that the default is already 0.5 — they
+// bite only on a file that would otherwise be allowlisted-authored.
 export const EXTERNAL_INGEST_MARKERS: ReadonlySet<string> = new Set([
   "n8n auto-detection",
   "auto-ingested",
   "morning-brief",
+  "agent-brief", // agent-generated brief (audit-added)
+  "bulk-import-scaffold", // scaffold emitted by bulk import, not Root content (audit-added)
   "readwise",
   "omnivore",
   "web-clipper",
   "web clipper",
 ]);
 
-// Explicit human-authorship markers — the ONLY values that promote a MIXED-folder
-// (03-outreach) file from the imported default to authored. FAIL-SAFE: an
-// unrecognized created_by value must NOT promote — a tampered or bulk-imported
-// contact in 03-outreach must never reach 0.9 (that is the injection vector this
-// folder is most exposed to). Extend this allowlist deliberately, never with a
-// catch-all that promotes "any value I don't recognize".
-export const AUTHORED_MARKERS: ReadonlySet<string> = new Set(["manual", "root"]);
-
-// frontmatter keys whose value can carry a provenance signal.
+// frontmatter keys whose value can carry an EXTERNAL-INGEST signal. NOTE: these
+// are read ONLY to DEMOTE (toward 0.5), NEVER to promote — provenance is never
+// raised to authored on the strength of a content-controlled field (the forgery
+// class). Promotion is location-only (AUTHORED_ALLOWLIST).
 const ORIGIN_KEYS = ["created_by", "generated_by", "updated_by", "source"] as const;
 
 /**
@@ -109,15 +147,6 @@ export function parseFrontmatterKeys(content: string): Record<string, string> {
   return out;
 }
 
-/** True if the user's own migration op (not an authorship signal, not external). */
-function isNeutralMigration(value: string): boolean {
-  return (
-    value.startsWith("bulk import") ||
-    value.startsWith("v2 migration") ||
-    value.startsWith("seed-synthesis")
-  );
-}
-
 /** External-ingest signal in frontmatter → file originated outside Root's writing. */
 function hasExternalIngestMarker(fm: Record<string, string>): boolean {
   for (const key of ORIGIN_KEYS) {
@@ -130,20 +159,6 @@ function hasExternalIngestMarker(fm: Record<string, string>): boolean {
   for (const key of ["url", "link", "source"]) {
     const v = fm[key];
     if (v && /^https?:\/\//.test(v)) return true;
-  }
-  return false;
-}
-
-/**
- * Positive authorship signal, used ONLY to promote a file in a MIXED folder
- * (03-outreach) from the imported default to authored. Requires an EXPLICIT
- * human-authorship marker (AUTHORED_MARKERS allowlist). An unrecognized value
- * does NOT promote — fail-safe, so a tampered/bulk-imported contact stays 0.5.
- */
-function hasAuthoredMarker(fm: Record<string, string>): boolean {
-  for (const key of ["created_by", "author", "updated_by"]) {
-    const v = fm[key];
-    if (v && AUTHORED_MARKERS.has(v)) return true;
   }
   return false;
 }
@@ -178,22 +193,23 @@ const unknown = (): ProvenanceResult => ({ provenance: "unknown", trust: TRUST_I
 /**
  * Classify a vault file's provenance + trust. `content` is the file's text (or
  * at least its leading frontmatter); omit it to classify by path alone, which
- * skips the frontmatter-based external/authored signals.
+ * skips the frontmatter-based external-ingest demotion.
  *
- * Precedence (first match wins):
- *   1. external-ingest frontmatter marker → imported (overrides folder)
- *   2. designated import folder           → imported
- *   3. mixed folder (03-outreach)         → imported, unless authored marker → authored
- *   4. authored folder OR loose top note  → authored
- *   5. anything else / undeterminable     → unknown (fail-safe, 0.5)
+ * DEFAULT-LOW precedence (first match wins):
+ *   1. external-ingest frontmatter marker → imported (overrides the allowlist)
+ *   2. authored allowlist folder          → authored (0.9) — the ONLY path up
+ *   3. known import / mixed folder         → imported (0.5, honest label)
+ *   4. anything else (loose root, unmarked, undeterminable) → unknown (0.5)
+ *
+ * There is NO path from folder-absence, loose-root, or a content-controlled
+ * frontmatter field to authored. 0.9 requires AUTHORED_ALLOWLIST membership.
  */
 export function classifyProvenance(relPath: string, content?: string): ProvenanceResult {
   const fm = content ? parseFrontmatterKeys(content) : {};
   const folder = topLevelFolder(relPath);
 
-  if (hasExternalIngestMarker(fm)) return imported(); // 1
-  if (IMPORT_FOLDERS.has(folder)) return imported(); // 2
-  if (MIXED_FOLDERS.has(folder)) return hasAuthoredMarker(fm) ? authored() : imported(); // 3
-  if (AUTHORED_FOLDERS.has(folder) || folder === "") return authored(); // 4
-  return unknown(); // 5
+  if (hasExternalIngestMarker(fm)) return imported(); // 1 — demotion always wins
+  if (AUTHORED_ALLOWLIST.has(folder)) return authored(); // 2 — positive, location-only
+  if (IMPORT_FOLDERS.has(folder)) return imported(); // 3 — honest imported label
+  return unknown(); // 4 — fail-safe low; no positive signal either way
 }
