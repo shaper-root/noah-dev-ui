@@ -1,4 +1,15 @@
-import { describe, test, expect, mock, beforeEach } from "bun:test";
+import { describe, test, expect, mock, beforeEach, afterAll } from "bun:test";
+
+// Capture the REAL implementations of the modules this file mocks BELOW, before
+// mock.module replaces them. bun's mock.module is process-global, so the partial
+// stubs registered here otherwise leak forward into data-boundary.test.ts /
+// kernel-seam.test.ts / tool-router.test.ts / tool-router-dispatch.test.ts —
+// whose imports of the un-stubbed exports (wrapVaultAsData, PassthroughKernel,
+// coerceMemoryArgs, the real dispatchTool) would fail to resolve. afterAll
+// restores the real modules once this file's tests finish.
+const realDataBoundary = { ...(await import("./data-boundary")) };
+const realKernelSeam = { ...(await import("./kernel-seam")) };
+const realToolRouter = { ...(await import("./tool-router")) };
 
 const mockModelChat = mock();
 const mockRecall = mock();
@@ -74,6 +85,14 @@ mock.module("./kernel", () => ({
     source: "passthrough",
   }),
 }));
+// Restore the real modules after this file so the process-global mock.module
+// stubs above don't leak into later-loaded test files (see capture block at top).
+afterAll(() => {
+  mock.module("./data-boundary", () => realDataBoundary);
+  mock.module("./kernel-seam", () => realKernelSeam);
+  mock.module("./tool-router", () => realToolRouter);
+});
+
 // Self-knowledge is NOT mocked: testConfig.vault.enabled=false makes the real
 // loader return passthrough deterministically, and not mocking here lets
 // self-knowledge.test.ts exercise the real module without bun's process-global
