@@ -98,6 +98,28 @@ export const config = {
     provider: env("NOAH_WEB_SEARCH_PROVIDER", "stub") as "stub" | "ddg",
   },
 
+  // Chat attachments (file uploads). Rootworks owns the UI + raw-byte storage
+  // (rootworks/data/uploads/{conv}/...). It proxies attachment metadata to Noah
+  // with a `local_path` RELATIVE to the Rootworks repo root; Noah reads the file
+  // from there (shared filesystem on the dev machine), extracts text, injects it
+  // into the turn, and writes a durable metadata sidecar into the vault `_noah/`
+  // jail. Default root is the sibling repo `../rootworks`.
+  attachments: {
+    rootworksRoot: env(
+      "NOAH_ROOTWORKS_ROOT",
+      resolve(import.meta.dir, "../rootworks"),
+    ),
+    // Hard cap on a single attachment Noah will read off disk (5 MB). A larger
+    // file is acknowledged + sidecar'd but not read inline.
+    maxBytes: envInt("NOAH_ATTACHMENT_MAX_BYTES", 5_000_000),
+    // Per-file cap on text injected into the model context (keeps a big file from
+    // blowing the context budget; the full text still lands in the vault sidecar).
+    injectChars: envInt("NOAH_ATTACHMENT_INJECT_CHARS", 8_000),
+    // Per-file cap on the extracted text embedded in the vault sidecar. Under the
+    // 256 KB writeNote limit with room for frontmatter.
+    vaultChars: envInt("NOAH_ATTACHMENT_VAULT_CHARS", 65_536),
+  },
+
   // Vault bridge (P3): cross-device sync via vault-as-bridge. Each device tags
   // its exports/summaries/observations with a stable device ID. NOAH_DEVICE_ID
   // overrides; otherwise inferred from platform (mac on Darwin, omen on Windows,

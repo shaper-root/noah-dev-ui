@@ -369,7 +369,13 @@ export async function dispatchTool(
       // "model:<provider>:<model_id>" so future trust gates can key on it.
       const modelId =
         config.provider === "local" ? config.ollama.model : config.cloud.model;
-      const sourceRef = `model:${config.provider}:${modelId}`;
+      // Default provenance is the writing model. noah.ts may override `source_ref`
+      // (host-controlled — e.g. attachment:{file}:{date} on attachment turns); the
+      // MCP tool schema does NOT advertise this arg, so a bare model can't set it.
+      const sourceRef =
+        typeof args.source_ref === "string" && args.source_ref.trim()
+          ? args.source_ref.trim()
+          : `model:${config.provider}:${modelId}`;
 
       // `explicit` is injected into the tool args by noah.ts when the user's
       // message expresses an unambiguous "remember this" intent. The MCP server

@@ -129,12 +129,15 @@ app.delete("/api/conversations/:id", (c) => {
 
 app.post("/api/chat", async (c) => {
   const body = await c.req.json();
-  const userMessage: string = body.message;
+  const userMessage: string = body.message || "";
   let conversationId: string | undefined = body.conversation_id;
   const externalHistory: Array<{ role: string; content: string }> | undefined =
     body.history;
+  // Attachments proxied by Rootworks (filename/mime/size + repo-relative
+  // local_path). Optional; validated/jailed downstream in attachments.ts.
+  const attachments = Array.isArray(body.attachments) ? body.attachments : undefined;
 
-  if (!userMessage) {
+  if (!userMessage && !(attachments && attachments.length)) {
     return c.json({ error: "message is required" }, 400);
   }
 
@@ -194,7 +197,7 @@ app.post("/api/chat", async (c) => {
         let fullResponse = "";
 
         try {
-          for await (const event of chat(userMessage, conversationId!, history)) {
+          for await (const event of chat(userMessage, conversationId!, history, attachments)) {
             switch (event.type) {
               case "token":
                 fullResponse += event.data;

@@ -22,6 +22,7 @@ import {
   readRecentSessionSummaries,
   type ExportedMemoryRow,
 } from "./vault-bridge";
+import { processAttachments, type IncomingAttachment } from "./attachments";
 
 const MAX_CORRECTIONS = 50;
 const MAX_SESSION_CONVERSATIONS = 500; // bound the in-process corrections map
@@ -359,9 +360,15 @@ export async function* chat(
   userMessage: string,
   conversationId: string,
   history: Array<{ role: string; content: string }>,
+  attachments?: IncomingAttachment[],
 ): AsyncGenerator<ChatEvent> {
   const startTime = Date.now();
-  log("info", "chat.start", { cid: conversationId, msgLen: userMessage.length, histLen: history.length });
+  log("info", "chat.start", {
+    cid: conversationId,
+    msgLen: userMessage.length,
+    histLen: history.length,
+    attachments: attachments?.length ?? 0,
+  });
 
   // Compute once and reuse — metadata event, gate-bypass injection, and the
   // done event all reference it.
@@ -552,8 +559,45 @@ export async function* chat(
     });
   }
 
+  // Attachments: read each file Rootworks uploaded for this turn, write a durable
+  // metadata sidecar into the vault `_noah/` jail, and inject the readable
+  // contents into the user turn. The vault write is a side effect that happens
+  // HERE (before generation) so an attachment survives even if the model call
+  // fails. attachmentMemoryRef is the host-controlled provenance applied to any
+  // memory the model stores this turn (so it reads attachment:{file}:{date}, not
+  // model:...). Fully swallowed: a bad attachment degrades to an inline note.
+  let attachmentsBlock = "";
+  let attachmentMemoryRef: string | null = null;
+  if (attachments && attachments.length > 0) {
+    yield {
+      type: "thinking",
+      data: `Reading ${attachments.length} attached file${attachments.length === 1 ? "" : "s"}…`,
+    };
+    try {
+      const processed = await processAttachments(attachments, {
+        conversationId,
+        contextHint: userMessage,
+      });
+      attachmentsBlock = processed.contextBlock;
+      attachmentMemoryRef = processed.memoryRef;
+      log("info", "attachments.processed", {
+        cid: conversationId,
+        count: processed.count,
+        read: processed.results.filter((r) => r.read).length,
+        stored: processed.results.filter((r) => r.sidecarPath).length,
+      });
+    } catch (err) {
+      log("warn", "attachments.process_fail", {
+        cid: conversationId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   const userContext = `\n${memoryContext}${sessionSummariesBlock}${conflictBlock}${sessionPrep}\n\n[SESSION CORRECTIONS]\n${correctionsBlock}`;
-  const augmentedUserMessage = kernelResult.processedMessage + userContext;
+  // Attachment contents ride on the user turn, between the user's words and the
+  // memory/context block, so the model reads them as part of what Root sent.
+  const augmentedUserMessage = kernelResult.processedMessage + attachmentsBlock + userContext;
 
   // Injection order: [system prompt] → [kernel] → [self-knowledge] → [memory] → [user].
   // Kernel + self-knowledge ride on the system message (so they precede the user
@@ -609,6 +653,8 @@ export async function* chat(
       // continuity briefing on this turn (history was empty AND memory had
       // something to brief on).
       session_start_brief: isFirstMessageOfSession && recallResult.count > 0,
+      // Number of files attached to this turn (0 when none).
+      attachments: attachments?.length ?? 0,
       kernel: {
         active: kernelLoad.active,
         tier: kernelLoad.tier,
@@ -735,6 +781,13 @@ export async function* chat(
           // user-message regex.
           if (n.name === "memory_remember") {
             n.args.explicit = explicitMemoryIntent;
+            // Host-controlled provenance (same trust model as `explicit`): when
+            // this turn carried attachments, tag the write attachment:{file}:{date};
+            // otherwise STRIP any model-supplied source_ref so tool-router falls
+            // back to the model:provider:id default. The model never gets to set
+            // its own provenance string.
+            if (attachmentMemoryRef) n.args.source_ref = attachmentMemoryRef;
+            else delete n.args.source_ref;
           }
 
           yield { type: "tool_call", data: JSON.stringify({ name: n.name, args: n.args }) };
@@ -798,7 +851,12 @@ export async function* chat(
                       ? (n.args.type as string)
                       : "fact",
                   source: "conversation",
-                  source_ref: `model:${config.provider}:${modelId}`,
+                  // Mirror the source_ref noah.ts set on the call (attachment:… for
+                  // attachment turns), so the vault export and memory.db agree.
+                  source_ref:
+                    typeof n.args.source_ref === "string" && n.args.source_ref
+                      ? (n.args.source_ref as string)
+                      : `model:${config.provider}:${modelId}`,
                   confidence:
                     typeof parsed.confidence === "number"
                       ? (parsed.confidence as number)
