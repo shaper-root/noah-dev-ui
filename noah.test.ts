@@ -1,4 +1,6 @@
 import { describe, test, expect, mock, beforeEach, afterAll } from "bun:test";
+import { existsSync } from "fs";
+import { resolve } from "path";
 
 // Capture the REAL implementations of the modules this file mocks BELOW, before
 // mock.module replaces them. bun's mock.module is process-global, so the partial
@@ -27,6 +29,10 @@ const testConfig = {
   // Required by the real loadSelfKnowledge module (which we no longer mock).
   // Disabled here so the loader returns passthrough cleanly without touching disk.
   vault: { enabled: false, path: "" },
+  // Required by the real skill-selector (also not mocked). Disabled by default so
+  // selectSkills() returns [] → skillBlock "" → system prompt byte-identical to
+  // the kernel-only path. Individual tests opt in by flipping enabled + libraryDir.
+  skills: { enabled: false, libraryDir: "", maxSkills: 3 },
   // Required by vault-bridge — disabled here so the real module returns
   // early and doesn't touch the filesystem or memory.db during tests.
   vaultBridge: { enabled: false, deviceId: "test" },
@@ -104,6 +110,10 @@ afterAll(() => {
 // pattern-matching logic.
 
 const { chat } = await import("./noah");
+// skill-selector is NOT mocked (like self-knowledge): testConfig.skills.enabled
+// defaults to false so the real selector returns [] deterministically. Imported
+// here (after the config mock) so the reset hook sees the mocked config.
+const { resetSkillRegistryCache } = await import("./skill-selector");
 
 type ChatEvent = { type: string; data: string };
 
@@ -129,6 +139,159 @@ beforeEach(() => {
 
   testConfig.maxToolRounds = 3;
   testConfig.maxContextChars = 40_000;
+  // Skills off by default; reset the per-process registry cache so a test that
+  // flips skills on re-reads the (mocked) config + disk fresh.
+  testConfig.skills.enabled = false;
+  testConfig.skills.libraryDir = "";
+  resetSkillRegistryCache();
+});
+
+const REAL_LIBRARY = resolve(import.meta.dir, "../../skillforge/library");
+const HAVE_LIBRARY = existsSync(REAL_LIBRARY);
+
+describe("OK-4 selective-skill seam (additive, kernel-unchanged)", () => {
+  // chat() calls modelClient.chat(messages, opts); messages[0] is the system msg.
+  function systemContent(): string {
+    return (
+      mockModelChat.mock.calls[0][0] as Array<{ role: string; content: string }>
+    )[0].content;
+  }
+  // The part that MUST be byte-stable across selection: everything before the
+  // trailing per-turn "Current time:" (which legitimately differs between calls).
+  function systemPrefix(): string {
+    return systemContent().split("\nCurrent time:")[0];
+  }
+
+  test("no skill selected -> system prompt carries no TASK SKILL block", async () => {
+    testConfig.skills.enabled = false;
+    await collect(chat("what's the weather in Paris?", "skill-off", []));
+    expect(systemContent()).not.toContain("TASK SKILL");
+  });
+
+  test("GOLDEN BASELINE: enabling skills on a NON-matching message is byte-identical", async () => {
+    // Baseline: selective layer disabled entirely.
+    await collect(chat("what's the weather in Paris?", "base-a", []));
+    const baseline = systemPrefix();
+
+    // Selective layer ENABLED, but the message matches nothing -> selection adds "".
+    mockModelChat.mockClear();
+    testConfig.skills.enabled = true;
+    testConfig.skills.libraryDir = REAL_LIBRARY;
+    resetSkillRegistryCache();
+    await collect(chat("what's the weather in Paris?", "base-b", []));
+    const withSelectorNoMatch = systemPrefix();
+
+    // INVIOLABLE PROPERTY: a non-matching turn is byte-identical whether or not
+    // the selective layer is enabled. Selection only ADDS; it never alters the
+    // kernel (or anything else) when no skill fires.
+    expect(withSelectorNoMatch).toBe(baseline);
+  });
+
+  test.skipIf(!HAVE_LIBRARY)(
+    "matching message injects cc-prompt-engineer beside the kernel",
+    async () => {
+      testConfig.skills.enabled = true;
+      testConfig.skills.libraryDir = REAL_LIBRARY;
+      resetSkillRegistryCache();
+
+      const events = await collect(
+        chat("Write a Claude Code prompt to add authentication", "skill-on", []),
+      );
+      expect(systemContent()).toContain(
+        "=== TASK SKILL: cc-prompt-engineer (selected for this turn) ===",
+      );
+
+      const meta = events.find((e: ChatEvent) => e.type === "metadata");
+      const parsed = JSON.parse(meta!.data);
+      expect(parsed.skills.injected).toContain("cc-prompt-engineer");
+      expect(parsed.skills.tokens).toBeGreaterThan(0);
+    },
+  );
+
+  test.skipIf(!HAVE_LIBRARY)(
+    "matching message offers the gated skill_reference tool",
+    async () => {
+      testConfig.skills.enabled = true;
+      testConfig.skills.libraryDir = REAL_LIBRARY;
+      resetSkillRegistryCache();
+      // Capture the tools advertised on the model call.
+      await collect(
+        chat("Write a Claude Code prompt to add authentication", "skill-tool", []),
+      );
+      const opts = mockModelChat.mock.calls[0][1] as { tools?: Array<{ function: { name: string } }> };
+      const toolNames = (opts.tools ?? []).map((t) => t.function.name);
+      expect(toolNames).toContain("skill_reference");
+    },
+  );
+
+  test("CRITICAL: a non-string message with skills ENABLED still completes the turn (kernel not dropped)", async () => {
+    // The selector runs before the system message is assembled, outside the
+    // turn's try/catch. A non-string body (reachable from an untyped HTTP
+    // payload) must NOT throw and abort — the turn must proceed (kernel loads),
+    // selection simply skipped. Regression guard for the adversarial-review
+    // CRITICAL kernel-drop.
+    testConfig.skills.enabled = true;
+    testConfig.skills.libraryDir = REAL_LIBRARY;
+    resetSkillRegistryCache();
+
+    let threw = false;
+    let events: ChatEvent[] = [];
+    try {
+      events = await collect(chat(123 as any, "nonstr", []));
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(false);
+    // The turn reached system-prompt assembly + the model call (kernel-bearing
+    // message built) — proven by metadata + token events being emitted.
+    expect(events.some((e) => e.type === "metadata")).toBe(true);
+    expect(events.some((e) => e.type === "token")).toBe(true);
+    // No skill selected on a non-string message.
+    const meta = events.find((e) => e.type === "metadata");
+    expect(JSON.parse(meta!.data).skills.injected).toEqual([]);
+  });
+
+  test.skipIf(!HAVE_LIBRARY)(
+    "skill_reference tool call routes to loadSkillReference, not dispatchTool",
+    async () => {
+      testConfig.skills.enabled = true;
+      testConfig.skills.libraryDir = REAL_LIBRARY;
+      resetSkillRegistryCache();
+
+      mockModelChat
+        .mockResolvedValueOnce({
+          content: "",
+          tool_calls: [
+            {
+              id: "r1",
+              function: {
+                name: "skill_reference",
+                arguments: { reference: "cc-prompt-engineer/prompt-patterns.md" },
+              },
+            },
+          ],
+          thinking: "",
+        })
+        .mockResolvedValueOnce({ content: "Here are the patterns.", tool_calls: [], thinking: "" });
+
+      const events = await collect(
+        chat("Write a Claude Code prompt to add authentication", "skill-ref", []),
+      );
+
+      // dispatchTool must NOT have seen skill_reference (it was intercepted).
+      const dispatched = mockDispatchTool.mock.calls.map((c: any[]) => c[0]?.function?.name);
+      expect(dispatched).not.toContain("skill_reference");
+
+      // The done event carries the intercepted result with real file content.
+      const done = events.find((e) => e.type === "done");
+      const calls = JSON.parse(done!.data).tool_calls as Array<{ name: string; result: string }>;
+      const ref = calls.find((c) => c.name === "skill_reference");
+      expect(ref).toBeTruthy();
+      const parsed = JSON.parse(ref!.result);
+      expect(parsed.content).toBeTruthy();
+      expect(parsed.error).toBeUndefined();
+    },
+  );
 });
 
 describe("agent loop resilience", () => {

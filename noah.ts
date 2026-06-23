@@ -13,6 +13,12 @@ import { loadKernel } from "./kernel";
 import { loadSelfKnowledge } from "./self-knowledge";
 import { getVaultIndexInjection } from "./vault-index";
 import { detectSkills } from "./skill-detect";
+import {
+  selectSkills,
+  loadSkillBlock,
+  getSkillReferenceTool,
+  loadSkillReference,
+} from "./skill-selector";
 import { log } from "./logger";
 import { memoryClient } from "./memory-client";
 import { createModelClient, type Message, type ToolCall } from "./model-client";
@@ -256,7 +262,7 @@ function extractJsonObject(text: string, start: number): string | null {
 }
 
 const TOOL_NAME_SOURCE =
-  '"name"\\s*:\\s*"(memory_remember|memory_recall|memory_forget|memory_inspect|web_research|vault_search|vault_read)"';
+  '"name"\\s*:\\s*"(memory_remember|memory_recall|memory_forget|memory_inspect|web_research|vault_search|vault_read|skill_reference)"';
 
 function parseToolCalls(message: {
   content?: string;
@@ -617,6 +623,18 @@ export async function* chat(
   const selfKnowledgeBlock = selfKnowledge.active
     ? `\n\n=== SELF-KNOWLEDGE (known weaknesses + active compensations) ===\n${selfKnowledge.text}\n=== END SELF-KNOWLEDGE ===\n`
     : "";
+  // OK-4 selective-skill seam. A cheap, deterministic rule-based selector matches
+  // the user's message against skillforge's `type: selective` skills and ADDS the
+  // matched skill's SKILL.md body beside the kernel — it NEVER touches kernelBlock.
+  // No match → skillBlock.text is "" and the system prompt is byte-identical to
+  // the kernel-only path. This is the same additive-block + per-turn-classifier
+  // machinery the kernel three-ring split will reuse for loading task rings.
+  const skillSelection = selectSkills(userMessage);
+  const skillBlock = loadSkillBlock(skillSelection);
+  // Built once per turn; gates the on-demand skill_reference tool below so it is
+  // offered ONLY when a selected skill actually has references (and is scoped to
+  // those files). Null when nothing selected → tool surface unchanged.
+  const skillReferenceTool = getSkillReferenceTool(skillSelection);
   // Vault index (Level 1 awareness): a compact digest of what's in Root's vault
   // — directory counts + the 20 most-recent notes with topic hints — so Noah
   // knows its notes exist without searching blind. First message only: it's
@@ -627,6 +645,10 @@ export async function* chat(
     SYSTEM_PROMPT +
     kernelBlock +
     selfKnowledgeBlock +
+    // Selective task skill(s) ride AFTER the kernel + self-knowledge (HOW to think
+    // and where it fails) and BEFORE the vault index (DATA): a task skill is added
+    // capability, not a change to the behavioral core. "" when nothing selected.
+    skillBlock.text +
     vaultIndexBlock +
     `\nCurrent time: ${timeStr}`;
   const messages: Message[] = [
@@ -660,6 +682,13 @@ export async function* chat(
         tier: kernelLoad.tier,
         version: kernelLoad.version,
         tokens: kernelLoad.tokenEstimate,
+      },
+      // OK-4: which selective task skill(s) the rule-based selector loaded this
+      // turn (empty array when none → kernel-only, byte-identical prompt).
+      skills: {
+        selected: skillSelection.map((s) => ({ name: s.name, score: s.score })),
+        injected: skillBlock.injected,
+        tokens: skillBlock.tokenEstimate,
       },
       self_knowledge: {
         active: selfKnowledge.active,
@@ -697,8 +726,15 @@ export async function* chat(
       // Phase 2B carve-out: memory tools are NEVER dropped by the context guard
       // or the final-round cutoff. A late memory_remember used to silently
       // vanish — now it always has a tool surface to land on. Optional tools
-      // (web_research, vault_*) still respect the limits.
-      const turnTools = optionalAvailable ? allTools : memoryOnlyTools;
+      // (web_research, vault_*, skill_reference) still respect the limits.
+      // The skill_reference tool is an OPTIONAL tool: present only when a
+      // selected skill has references AND optional tools are allowed this round.
+      const turnTools =
+        optionalAvailable && skillReferenceTool
+          ? [...allTools, skillReferenceTool]
+          : optionalAvailable
+            ? allTools
+            : memoryOnlyTools;
       const includeTools = turnTools.length > 0;
 
       if (contextExceeded && round < config.maxToolRounds) {
@@ -799,6 +835,13 @@ export async function* chat(
               error: `Could not parse arguments for ${n.name}. Provide valid JSON arguments.`,
             });
             log("warn", "tool.argparse_fail", { cid: conversationId, name: n.name });
+          } else if (n.name === "skill_reference") {
+            // OK-4 two-layer pattern: load an on-demand reference for an active
+            // skill. Handled here (not in tool-router) because the whitelist is
+            // turn-scoped to THIS turn's selected skills — the model can never
+            // read a file outside the selected skills' references/ dirs.
+            result = loadSkillReference(skillSelection, n.args);
+            log("info", "tool.ok", { cid: conversationId, name: n.name, ms: Date.now() - toolStart });
           } else {
             try {
               // Pass the already-parsed object so dispatchTool does not re-parse.
@@ -1005,6 +1048,10 @@ export async function* chat(
         memory_ids: recallResult.memories.map((m) => m.id),
         tools_fired: [...new Set(toolCallsMade.map((tc) => tc.name))],
         skills_active: skillsActive,
+        // OK-4: the selective task skill(s) the rule-based selector loaded for
+        // this turn (distinct from skills_active, which is the post-hoc kernel-
+        // skill heuristic). Empty when nothing matched.
+        skills_selected: skillBlock.injected,
         kernel_version: kernelLoad.active ? kernelLoad.version : "none",
         degraded,
       },

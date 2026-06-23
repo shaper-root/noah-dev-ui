@@ -74,6 +74,24 @@ export const config = {
     ),
   },
 
+  // Selective task skills (OK-4 loader seam). The always-on kernel above always
+  // loads; THIS is the additive layer — a cheap rule-based selector reads
+  // skillforge's `library/` for `type: selective` skills and injects the
+  // matched skill's SKILL.md beside (never replacing) the kernel. Disabled →
+  // selection is a no-op and the system prompt is byte-identical to kernel-only.
+  // Like the kernel, the skill files live in skillforge; an edit is picked up on
+  // next restart. Reads straight from the library (sibling of the Noah repo).
+  skills: {
+    enabled: envBool("NOAH_SKILLS_ENABLED", true),
+    libraryDir: env(
+      "NOAH_SKILLS_LIBRARY_DIR",
+      resolve(import.meta.dir, "../../skillforge/library"),
+    ),
+    // Soft cap on simultaneously-injected task skills (the selection protocol's
+    // "3"). Keeps a pathological multi-match from ballooning the system prompt.
+    maxSkills: envInt("NOAH_SKILLS_MAX", 3),
+  },
+
   // Obsidian vault read access (P2). READ-ONLY: Noah reads Root's curated notes on
   // demand; it never writes to the vault and never auto-imports vault content into
   // memory. Sensitive subtrees are excluded by default (IP boundary).
@@ -169,6 +187,9 @@ export function validateConfig(): void {
   console.log(`[noah] Web search: ${config.webSearch.provider}`);
   console.log(
     `[noah] Kernel: ${config.kernel.enabled ? config.kernel.tier : "disabled"}`,
+  );
+  console.log(
+    `[noah] Skills: ${config.skills.enabled ? `enabled (max=${config.skills.maxSkills})` : "disabled"}`,
   );
   console.log(
     `[noah] Vault: ${config.vault.enabled ? config.vault.path : "disabled"}`,
